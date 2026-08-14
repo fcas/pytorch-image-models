@@ -38,15 +38,33 @@ Modifications and additions for timm hacked together by / Copyright 2022, Ross W
 # No code was used directly from ConvNeXt-V2, however the weights are CC BY-NC 4.0 so beware if using commercially.
 
 from functools import partial
-from typing import Callable, List, Optional, Tuple, Union
+from typing import Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
 
 from timm.data import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD, OPENAI_CLIP_MEAN, OPENAI_CLIP_STD
-from timm.layers import trunc_normal_, AvgPool2dSame, DropPath, Mlp, GlobalResponseNormMlp, \
-    LayerNorm2d, LayerNorm, create_conv2d, get_act_layer, make_divisible, to_ntuple
-from timm.layers import NormMlpClassifierHead, ClassifierHead
+from timm.layers import (
+    trunc_normal_,
+    AvgPool2dSame,
+    DropPath,
+    calculate_drop_path_rates,
+    Mlp,
+    GlobalResponseNormMlp,
+    LayerNorm2d,
+    LayerNorm,
+    RmsNorm2d,
+    RmsNorm,
+    SimpleNorm2d,
+    SimpleNorm,
+    create_conv2d,
+    get_act_layer,
+    get_norm_layer,
+    make_divisible,
+    to_ntuple,
+    NormMlpClassifierHead,
+    ClassifierHead,
+)
 from ._builder import build_model_with_cfg
 from ._features import feature_take_indices
 from ._manipulate import named_apply, checkpoint_seq
@@ -56,8 +74,26 @@ __all__ = ['ConvNeXt']  # model_registry will add each entrypoint fn to this
 
 
 class Downsample(nn.Module):
+    """Downsample module for ConvNeXt."""
 
-    def __init__(self, in_chs, out_chs, stride=1, dilation=1):
+    def __init__(
+            self,
+            in_chs: int,
+            out_chs: int,
+            stride: int = 1,
+            dilation: int = 1,
+            device=None,
+            dtype=None,
+    ) -> None:
+        """Initialize Downsample module.
+
+        Args:
+            in_chs: Number of input channels.
+            out_chs: Number of output channels.
+            stride: Stride for downsampling.
+            dilation: Dilation rate.
+        """
+        dd = {'device': device, 'dtype': dtype}
         super().__init__()
         avg_stride = stride if dilation == 1 else 1
         if stride > 1 or dilation > 1:
@@ -67,18 +103,20 @@ class Downsample(nn.Module):
             self.pool = nn.Identity()
 
         if in_chs != out_chs:
-            self.conv = create_conv2d(in_chs, out_chs, 1, stride=1)
+            self.conv = create_conv2d(in_chs, out_chs, 1, stride=1, **dd)
         else:
             self.conv = nn.Identity()
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass."""
         x = self.pool(x)
         x = self.conv(x)
         return x
 
 
 class ConvNeXtBlock(nn.Module):
-    """ ConvNeXt Block
+    """ConvNeXt Block.
+
     There are two equivalent implementations:
       (1) DwConv -> LayerNorm (channels_first) -> 1x1 Conv -> GELU -> 1x1 Conv; all in (N, C, H, W)
       (2) DwConv -> Permute to (N, H, W, C); LayerNorm (channels_last) -> Linear -> GELU -> Linear; Permute back
@@ -103,6 +141,8 @@ class ConvNeXtBlock(nn.Module):
             act_layer: Union[str, Callable] = 'gelu',
             norm_layer: Optional[Callable] = None,
             drop_path: float = 0.,
+            device=None,
+            dtype=None,
     ):
         """
 
@@ -121,6 +161,7 @@ class ConvNeXtBlock(nn.Module):
             norm_layer: Normalization layer (defaults to LN if not specified).
             drop_path: Stochastic depth probability.
         """
+        dd = {'device': device, 'dtype': dtype}
         super().__init__()
         out_chs = out_chs or in_chs
         dilation = to_ntuple(2)(dilation)
@@ -137,17 +178,24 @@ class ConvNeXtBlock(nn.Module):
             dilation=dilation[0],
             depthwise=True,
             bias=conv_bias,
+            **dd,
         )
-        self.norm = norm_layer(out_chs)
-        self.mlp = mlp_layer(out_chs, int(mlp_ratio * out_chs), act_layer=act_layer)
-        self.gamma = nn.Parameter(ls_init_value * torch.ones(out_chs)) if ls_init_value is not None else None
+        self.norm = norm_layer(out_chs, **dd)
+        self.mlp = mlp_layer(
+            out_chs,
+            int(mlp_ratio * out_chs),
+            act_layer=act_layer,
+            **dd,
+        )
+        self.gamma = nn.Parameter(ls_init_value * torch.ones(out_chs, **dd)) if ls_init_value is not None else None
         if in_chs != out_chs or stride != 1 or dilation[0] != dilation[1]:
-            self.shortcut = Downsample(in_chs, out_chs, stride=stride, dilation=dilation[0])
+            self.shortcut = Downsample(in_chs, out_chs, stride=stride, dilation=dilation[0], **dd)
         else:
             self.shortcut = nn.Identity()
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass."""
         shortcut = x
         x = self.conv_dw(x)
         if self.use_conv_mlp:
@@ -166,24 +214,46 @@ class ConvNeXtBlock(nn.Module):
 
 
 class ConvNeXtStage(nn.Module):
+    """ConvNeXt stage (multiple blocks)."""
 
     def __init__(
             self,
-            in_chs,
-            out_chs,
-            kernel_size=7,
-            stride=2,
-            depth=2,
-            dilation=(1, 1),
-            drop_path_rates=None,
-            ls_init_value=1.0,
-            conv_mlp=False,
-            conv_bias=True,
-            use_grn=False,
-            act_layer='gelu',
-            norm_layer=None,
-            norm_layer_cl=None
-    ):
+            in_chs: int,
+            out_chs: int,
+            kernel_size: int = 7,
+            stride: int = 2,
+            depth: int = 2,
+            dilation: Tuple[int, int] = (1, 1),
+            drop_path_rates: Optional[List[float]] = None,
+            ls_init_value: float = 1.0,
+            conv_mlp: bool = False,
+            conv_bias: bool = True,
+            use_grn: bool = False,
+            act_layer: Union[str, Callable] = 'gelu',
+            norm_layer: Optional[Callable] = None,
+            norm_layer_cl: Optional[Callable] = None,
+            device=None,
+            dtype=None,
+    ) -> None:
+        """Initialize ConvNeXt stage.
+
+        Args:
+            in_chs: Number of input channels.
+            out_chs: Number of output channels.
+            kernel_size: Kernel size for depthwise convolution.
+            stride: Stride for downsampling.
+            depth: Number of blocks in stage.
+            dilation: Dilation rates.
+            drop_path_rates: Drop path rates for each block.
+            ls_init_value: Initial value for layer scale.
+            conv_mlp: Use convolutional MLP.
+            conv_bias: Use bias in convolutions.
+            use_grn: Use global response normalization.
+            act_layer: Activation layer.
+            norm_layer: Normalization layer.
+            norm_layer_cl: Normalization layer for channels last.
+        """
+        dd = {'device': device, 'dtype': dtype}
         super().__init__()
         self.grad_checkpointing = False
 
@@ -191,7 +261,7 @@ class ConvNeXtStage(nn.Module):
             ds_ks = 2 if stride > 1 or dilation[0] != dilation[1] else 1
             pad = 'same' if dilation[1] > 1 else 0  # same padding needed if dilation used
             self.downsample = nn.Sequential(
-                norm_layer(in_chs),
+                norm_layer(in_chs, **dd),
                 create_conv2d(
                     in_chs,
                     out_chs,
@@ -200,6 +270,7 @@ class ConvNeXtStage(nn.Module):
                     dilation=dilation[0],
                     padding=pad,
                     bias=conv_bias,
+                    **dd,
                 ),
             )
             in_chs = out_chs
@@ -221,11 +292,13 @@ class ConvNeXtStage(nn.Module):
                 use_grn=use_grn,
                 act_layer=act_layer,
                 norm_layer=norm_layer if conv_mlp else norm_layer_cl,
+                **dd,
             ))
             in_chs = out_chs
         self.blocks = nn.Sequential(*stage_blocks)
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass."""
         x = self.downsample(x)
         if self.grad_checkpointing and not torch.jit.is_scripting():
             x = checkpoint_seq(self.blocks, x)
@@ -233,10 +306,39 @@ class ConvNeXtStage(nn.Module):
             x = self.blocks(x)
         return x
 
+# map of norm layers with NCHW (2D) and channels last variants
+_NORM_MAP = {
+    'layernorm': (LayerNorm2d, LayerNorm),
+    'layernorm2d': (LayerNorm2d, LayerNorm),
+    'simplenorm': (SimpleNorm2d, SimpleNorm),
+    'simplenorm2d': (SimpleNorm2d, SimpleNorm),
+    'rmsnorm': (RmsNorm2d, RmsNorm),
+    'rmsnorm2d': (RmsNorm2d, RmsNorm),
+}
+
+
+def _get_norm_layers(norm_layer: Union[Callable, str], conv_mlp: bool, norm_eps: float):
+    norm_layer = norm_layer or 'layernorm'
+    if norm_layer in _NORM_MAP:
+        norm_layer_cl = _NORM_MAP[norm_layer][0] if conv_mlp else _NORM_MAP[norm_layer][1]
+        norm_layer = _NORM_MAP[norm_layer][0]
+        if norm_eps is not None:
+            norm_layer = partial(norm_layer, eps=norm_eps)
+            norm_layer_cl = partial(norm_layer_cl, eps=norm_eps)
+    else:
+        assert conv_mlp, \
+            'If a norm_layer is specified, conv MLP must be used so all norm expect rank-4, channels-first input'
+        norm_layer = get_norm_layer(norm_layer)
+        norm_layer_cl = norm_layer
+        if norm_eps is not None:
+            norm_layer_cl = partial(norm_layer_cl, eps=norm_eps)
+    return norm_layer, norm_layer_cl
+
 
 class ConvNeXt(nn.Module):
-    r""" ConvNeXt
-        A PyTorch impl of : `A ConvNet for the 2020s`  - https://arxiv.org/pdf/2201.03545.pdf
+    """ConvNeXt model architecture.
+
+    A PyTorch impl of : `A ConvNet for the 2020s`  - https://arxiv.org/pdf/2201.03545.pdf
     """
 
     def __init__(
@@ -262,6 +364,8 @@ class ConvNeXt(nn.Module):
             norm_eps: Optional[float] = None,
             drop_rate: float = 0.,
             drop_path_rate: float = 0.,
+            device=None,
+            dtype=None,
     ):
         """
         Args:
@@ -287,44 +391,37 @@ class ConvNeXt(nn.Module):
             drop_path_rate: Stochastic depth drop rate.
         """
         super().__init__()
+        dd = {'device': device, 'dtype': dtype}
         assert output_stride in (8, 16, 32)
         kernel_sizes = to_ntuple(4)(kernel_sizes)
-        if norm_layer is None:
-            norm_layer = LayerNorm2d
-            norm_layer_cl = norm_layer if conv_mlp else LayerNorm
-            if norm_eps is not None:
-                norm_layer = partial(norm_layer, eps=norm_eps)
-                norm_layer_cl = partial(norm_layer_cl, eps=norm_eps)
-        else:
-            assert conv_mlp,\
-                'If a norm_layer is specified, conv MLP must be used so all norm expect rank-4, channels-first input'
-            norm_layer_cl = norm_layer
-            if norm_eps is not None:
-                norm_layer_cl = partial(norm_layer_cl, eps=norm_eps)
+        norm_layer, norm_layer_cl = _get_norm_layers(norm_layer, conv_mlp, norm_eps)
+        act_layer = get_act_layer(act_layer)
 
         self.num_classes = num_classes
+        self.in_chans = in_chans
         self.drop_rate = drop_rate
         self.feature_info = []
 
-        assert stem_type in ('patch', 'overlap', 'overlap_tiered')
+        assert stem_type in ('patch', 'overlap', 'overlap_tiered', 'overlap_act')
         if stem_type == 'patch':
             # NOTE: this stem is a minimal form of ViT PatchEmbed, as used in SwinTransformer w/ patch_size = 4
             self.stem = nn.Sequential(
-                nn.Conv2d(in_chans, dims[0], kernel_size=patch_size, stride=patch_size, bias=conv_bias),
-                norm_layer(dims[0]),
+                nn.Conv2d(in_chans, dims[0], kernel_size=patch_size, stride=patch_size, bias=conv_bias, **dd),
+                norm_layer(dims[0], **dd),
             )
             stem_stride = patch_size
         else:
             mid_chs = make_divisible(dims[0] // 2) if 'tiered' in stem_type else dims[0]
-            self.stem = nn.Sequential(
-                nn.Conv2d(in_chans, mid_chs, kernel_size=3, stride=2, padding=1, bias=conv_bias),
-                nn.Conv2d(mid_chs, dims[0], kernel_size=3, stride=2, padding=1, bias=conv_bias),
-                norm_layer(dims[0]),
-            )
+            self.stem = nn.Sequential(*filter(None, [
+                nn.Conv2d(in_chans, mid_chs, kernel_size=3, stride=2, padding=1, bias=conv_bias, **dd),
+                act_layer() if 'act' in stem_type else None,
+                nn.Conv2d(mid_chs, dims[0], kernel_size=3, stride=2, padding=1, bias=conv_bias, **dd),
+                norm_layer(dims[0], **dd),
+            ]))
             stem_stride = 4
 
         self.stages = nn.Sequential()
-        dp_rates = [x.tolist() for x in torch.linspace(0, drop_path_rate, sum(depths)).split(depths)]
+        dp_rates = calculate_drop_path_rates(drop_path_rate, depths, stagewise=True)
         stages = []
         prev_chs = dims[0]
         curr_stride = stem_stride
@@ -353,23 +450,25 @@ class ConvNeXt(nn.Module):
                 act_layer=act_layer,
                 norm_layer=norm_layer,
                 norm_layer_cl=norm_layer_cl,
+                **dd,
             ))
             prev_chs = out_chs
             # NOTE feature_info use currently assumes stage 0 == stride 1, rest are stride 2
             self.feature_info += [dict(num_chs=prev_chs, reduction=curr_stride, module=f'stages.{i}')]
         self.stages = nn.Sequential(*stages)
-        self.num_features = prev_chs
+        self.num_features = self.head_hidden_size = prev_chs
 
         # if head_norm_first == true, norm -> global pool -> fc ordering, like most other nets
         # otherwise pool -> norm -> fc, the default ConvNeXt ordering (pretrained FB weights)
         if head_norm_first:
             assert not head_hidden_size
-            self.norm_pre = norm_layer(self.num_features)
+            self.norm_pre = norm_layer(self.num_features, **dd)
             self.head = ClassifierHead(
                 self.num_features,
                 num_classes,
                 pool_type=global_pool,
                 drop_rate=self.drop_rate,
+                **dd,
             )
         else:
             self.norm_pre = nn.Identity()
@@ -381,11 +480,21 @@ class ConvNeXt(nn.Module):
                 drop_rate=self.drop_rate,
                 norm_layer=norm_layer,
                 act_layer='gelu',
+                **dd,
             )
+            self.head_hidden_size = self.head.num_features
         named_apply(partial(_init_weights, head_init_scale=head_init_scale), self)
 
     @torch.jit.ignore
-    def group_matcher(self, coarse=False):
+    def group_matcher(self, coarse: bool = False) -> Dict[str, Union[str, List]]:
+        """Create regex patterns for parameter grouping.
+
+        Args:
+            coarse: Use coarse grouping.
+
+        Returns:
+            Dictionary mapping group names to regex patterns.
+        """
         return dict(
             stem=r'^stem',
             blocks=r'^stages\.(\d+)' if coarse else [
@@ -396,98 +505,138 @@ class ConvNeXt(nn.Module):
         )
 
     @torch.jit.ignore
-    def set_grad_checkpointing(self, enable=True):
+    def set_grad_checkpointing(self, enable: bool = True) -> None:
+        """Enable or disable gradient checkpointing.
+
+        Args:
+            enable: Whether to enable gradient checkpointing.
+        """
         for s in self.stages:
             s.grad_checkpointing = enable
 
     @torch.jit.ignore
-    def get_classifier(self):
+    def get_classifier(self) -> nn.Module:
+        """Get the classifier module."""
         return self.head.fc
 
-    def reset_classifier(self, num_classes=0, global_pool=None):
+    def reset_classifier(self, num_classes: int, global_pool: Optional[str] = None) -> None:
+        """Reset the classifier head.
+
+        Args:
+            num_classes: Number of classes for new classifier.
+            global_pool: Global pooling type.
+        """
+        self.num_classes = num_classes
         self.head.reset(num_classes, global_pool)
 
     def forward_intermediates(
             self,
             x: torch.Tensor,
-            indices: Optional[Union[int, List[int], Tuple[int]]] = None,
+            indices: Optional[Union[int, List[int]]] = None,
             norm: bool = False,
             stop_early: bool = False,
             output_fmt: str = 'NCHW',
             intermediates_only: bool = False,
     ) -> Union[List[torch.Tensor], Tuple[torch.Tensor, List[torch.Tensor]]]:
-        """ Forward features that returns intermediates.
+        """Forward features that returns intermediates.
 
         Args:
-            x: Input image tensor
-            indices: Take last n blocks if int, all if None, select matching indices if sequence
-            norm: Apply norm layer to compatible intermediates
-            stop_early: Stop iterating over blocks when last desired intermediate hit
-            output_fmt: Shape of intermediate feature outputs
-            intermediates_only: Only return intermediate features
-        Returns:
+            x: Input image tensor.
+            indices: Take last n blocks if int, all if None, select matching indices if sequence.
+            norm: Apply norm layer to compatible intermediates.
+            stop_early: Stop iterating over blocks when last desired intermediate hit.
+            output_fmt: Shape of intermediate feature outputs.
+            intermediates_only: Only return intermediate features.
 
+        Returns:
+            List of intermediate features or tuple of (final features, intermediates).
         """
         assert output_fmt in ('NCHW',), 'Output shape must be NCHW.'
         intermediates = []
-        take_indices, max_index = feature_take_indices(len(self.stages) + 1, indices)
+        take_indices, max_index = feature_take_indices(len(self.stages), indices)
 
         # forward pass
-        feat_idx = 0  # stem is index 0
         x = self.stem(x)
-        if feat_idx in take_indices:
-            intermediates.append(x)
 
+        last_idx = len(self.stages) - 1
         if torch.jit.is_scripting() or not stop_early:  # can't slice blocks in torchscript
             stages = self.stages
         else:
-            stages = self.stages[:max_index]
-        for stage in stages:
-            feat_idx += 1
+            stages = self.stages[:max_index + 1]
+        for feat_idx, stage in enumerate(stages):
             x = stage(x)
             if feat_idx in take_indices:
-                # NOTE not bothering to apply norm_pre when norm=True as almost no models have it enabled
-                intermediates.append(x)
+                if norm and feat_idx == last_idx:
+                    intermediates.append(self.norm_pre(x))
+                else:
+                    intermediates.append(x)
 
         if intermediates_only:
             return intermediates
 
-        x = self.norm_pre(x)
+        if feat_idx == last_idx:
+            x = self.norm_pre(x)
 
         return x, intermediates
 
     def prune_intermediate_layers(
             self,
-            indices: Union[int, List[int], Tuple[int]] = 1,
+            indices: Union[int, List[int]] = 1,
             prune_norm: bool = False,
             prune_head: bool = True,
-    ):
-        """ Prune layers not required for specified intermediates.
+    ) -> List[int]:
+        """Prune layers not required for specified intermediates.
+
+        Args:
+            indices: Indices of intermediate layers to keep.
+            prune_norm: Whether to prune normalization layer.
+            prune_head: Whether to prune the classifier head.
+
+        Returns:
+            List of indices that were kept.
         """
-        take_indices, max_index = feature_take_indices(len(self.stages) + 1, indices)
-        self.stages = self.stages[:max_index]  # truncate blocks w/ stem as idx 0
+        take_indices, max_index = feature_take_indices(len(self.stages), indices)
+        self.stages = self.stages[:max_index + 1]  # truncate blocks w/ stem as idx 0
         if prune_norm:
             self.norm_pre = nn.Identity()
         if prune_head:
             self.reset_classifier(0, '')
         return take_indices
 
-    def forward_features(self, x):
+    def forward_features(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass through feature extraction layers."""
         x = self.stem(x)
         x = self.stages(x)
         x = self.norm_pre(x)
         return x
 
-    def forward_head(self, x, pre_logits: bool = False):
+    def forward_head(self, x: torch.Tensor, pre_logits: bool = False) -> torch.Tensor:
+        """Forward pass through classifier head.
+
+        Args:
+            x: Feature tensor.
+            pre_logits: Return features before final classifier.
+
+        Returns:
+            Output tensor.
+        """
         return self.head(x, pre_logits=True) if pre_logits else self.head(x)
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass."""
         x = self.forward_features(x)
         x = self.forward_head(x)
         return x
 
 
-def _init_weights(module, name=None, head_init_scale=1.0):
+def _init_weights(module: nn.Module, name: Optional[str] = None, head_init_scale: float = 1.0) -> None:
+    """Initialize model weights.
+
+    Args:
+        module: Module to initialize.
+        name: Module name.
+        head_init_scale: Scale factor for head initialization.
+    """
     if isinstance(module, nn.Conv2d):
         trunc_normal_(module.weight, std=.02)
         if module.bias is not None:
@@ -522,6 +671,9 @@ def checkpoint_filter_fn(state_dict, model):
 
     import re
     for k, v in state_dict.items():
+        if k.startswith(('projectors.', 'norms.')):
+            # discard optional EUPE distillation/projector heads and feature norms
+            continue
         k = k.replace('downsample_layers.0.', 'stem.')
         k = re.sub(r'stages.([0-9]+).([0-9]+)', r'stages.\1.blocks.\2', k)
         k = re.sub(r'downsample_layers.([0-9]+).([0-9]+)', r'stages.\1.downsample.\2', k)
@@ -563,7 +715,7 @@ def _cfg(url='', **kwargs):
         'crop_pct': 0.875, 'interpolation': 'bicubic',
         'mean': IMAGENET_DEFAULT_MEAN, 'std': IMAGENET_DEFAULT_STD,
         'first_conv': 'stem.0', 'classifier': 'head.fc',
-        **kwargs
+        'license': 'apache-2.0', **kwargs
     }
 
 
@@ -590,6 +742,13 @@ default_cfgs = generate_default_cfgs({
         hf_hub_id='timm/',
         crop_pct=0.95, test_input_size=(3, 288, 288), test_crop_pct=1.0),
 
+    'convnext_zepto_rms.ra4_e3600_r224_in1k': _cfg(
+        hf_hub_id='timm/',
+        mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5)),
+    'convnext_zepto_rms_ols.ra4_e3600_r224_in1k': _cfg(
+        hf_hub_id='timm/',
+        mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5),
+        crop_pct=0.9),
     'convnext_atto.d2_in1k': _cfg(
         url='https://github.com/rwightman/pytorch-image-models/releases/download/v0.1-rsb-weights/convnext_atto_d2-01bb0f51.pth',
         hf_hub_id='timm/',
@@ -598,6 +757,9 @@ default_cfgs = generate_default_cfgs({
         url='https://github.com/rwightman/pytorch-image-models/releases/download/v0.1-rsb-weights/convnext_atto_ols_a2-78d1c8f3.pth',
         hf_hub_id='timm/',
         test_input_size=(3, 288, 288), test_crop_pct=0.95),
+    'convnext_atto_rms.untrained': _cfg(
+        #hf_hub_id='timm/',
+        test_input_size=(3, 256, 256), test_crop_pct=0.95),
     'convnext_femto.d1_in1k': _cfg(
         url='https://github.com/rwightman/pytorch-image-models/releases/download/v0.1-rsb-weights/convnext_femto_d1-d71d5b4c.pth',
         hf_hub_id='timm/',
@@ -629,6 +791,9 @@ default_cfgs = generate_default_cfgs({
         url='https://github.com/rwightman/pytorch-image-models/releases/download/v0.1-rsb-weights/convnext_tiny_hnf_a2h-ab7e9df2.pth',
         hf_hub_id='timm/',
         crop_pct=0.95, test_input_size=(3, 288, 288), test_crop_pct=1.0),
+    'convnext_nano.r384_in12k_ft_in1k': _cfg(
+        hf_hub_id='timm/',
+        input_size=(3, 384, 384), pool_size=(12, 12), crop_pct=1.0),
 
     'convnext_tiny.in12k_ft_in1k_384': _cfg(
         hf_hub_id='timm/',
@@ -640,6 +805,12 @@ default_cfgs = generate_default_cfgs({
     'convnext_nano.in12k': _cfg(
         hf_hub_id='timm/',
         crop_pct=0.95, num_classes=11821),
+    'convnext_nano.r384_in12k': _cfg(
+        hf_hub_id='timm/',
+        input_size=(3, 384, 384), pool_size=(12, 12), crop_pct=1.0, num_classes=11821),
+    'convnext_nano.r384_ad_in12k': _cfg(
+        hf_hub_id='timm/',
+        input_size=(3, 384, 384), pool_size=(12, 12), crop_pct=1.0, num_classes=11821),
     'convnext_tiny.in12k': _cfg(
         hf_hub_id='timm/',
         crop_pct=0.95, num_classes=11821),
@@ -900,56 +1071,128 @@ default_cfgs = generate_default_cfgs({
 
     # CLIP original image tower weights
     'convnext_base.clip_laion2b': _cfg(
-        hf_hub_id='laion/CLIP-convnext_base_w-laion2B-s13B-b82K',
-        hf_hub_filename='open_clip_pytorch_model.bin',
+        hf_hub_id='timm/',
         mean=OPENAI_CLIP_MEAN, std=OPENAI_CLIP_STD,
         input_size=(3, 256, 256), pool_size=(8, 8), crop_pct=1.0, num_classes=640),
     'convnext_base.clip_laion2b_augreg': _cfg(
-        hf_hub_id='laion/CLIP-convnext_base_w-laion2B-s13B-b82K-augreg',
-        hf_hub_filename='open_clip_pytorch_model.bin',
+        hf_hub_id='timm/',
         mean=OPENAI_CLIP_MEAN, std=OPENAI_CLIP_STD,
         input_size=(3, 256, 256), pool_size=(8, 8), crop_pct=1.0, num_classes=640),
     'convnext_base.clip_laiona': _cfg(
-        hf_hub_id='laion/CLIP-convnext_base_w-laion_aesthetic-s13B-b82K',
-        hf_hub_filename='open_clip_pytorch_model.bin',
+        hf_hub_id='timm/',
         mean=OPENAI_CLIP_MEAN, std=OPENAI_CLIP_STD,
         input_size=(3, 256, 256), pool_size=(8, 8), crop_pct=1.0, num_classes=640),
     'convnext_base.clip_laiona_320': _cfg(
-        hf_hub_id='laion/CLIP-convnext_base_w_320-laion_aesthetic-s13B-b82K',
-        hf_hub_filename='open_clip_pytorch_model.bin',
+        hf_hub_id='timm/',
         mean=OPENAI_CLIP_MEAN, std=OPENAI_CLIP_STD,
         input_size=(3, 320, 320), pool_size=(10, 10), crop_pct=1.0, num_classes=640),
     'convnext_base.clip_laiona_augreg_320': _cfg(
-        hf_hub_id='laion/CLIP-convnext_base_w_320-laion_aesthetic-s13B-b82K-augreg',
-        hf_hub_filename='open_clip_pytorch_model.bin',
+        hf_hub_id='timm/',
         mean=OPENAI_CLIP_MEAN, std=OPENAI_CLIP_STD,
         input_size=(3, 320, 320), pool_size=(10, 10), crop_pct=1.0, num_classes=640),
     'convnext_large_mlp.clip_laion2b_augreg': _cfg(
-        hf_hub_id='laion/CLIP-convnext_large_d.laion2B-s26B-b102K-augreg',
-        hf_hub_filename='open_clip_pytorch_model.bin',
+        hf_hub_id='timm/',
         mean=OPENAI_CLIP_MEAN, std=OPENAI_CLIP_STD,
         input_size=(3, 256, 256), pool_size=(8, 8), crop_pct=1.0, num_classes=768),
     'convnext_large_mlp.clip_laion2b_ft_320': _cfg(
-        hf_hub_id='laion/CLIP-convnext_large_d_320.laion2B-s29B-b131K-ft',
-        hf_hub_filename='open_clip_pytorch_model.bin',
+        hf_hub_id='timm/',
         mean=OPENAI_CLIP_MEAN, std=OPENAI_CLIP_STD,
         input_size=(3, 320, 320), pool_size=(10, 10), crop_pct=1.0, num_classes=768),
     'convnext_large_mlp.clip_laion2b_ft_soup_320': _cfg(
-        hf_hub_id='laion/CLIP-convnext_large_d_320.laion2B-s29B-b131K-ft-soup',
-        hf_hub_filename='open_clip_pytorch_model.bin',
+        hf_hub_id='timm/',
         mean=OPENAI_CLIP_MEAN, std=OPENAI_CLIP_STD,
         input_size=(3, 320, 320), pool_size=(10, 10), crop_pct=1.0, num_classes=768),
     'convnext_xxlarge.clip_laion2b_soup': _cfg(
-        hf_hub_id='laion/CLIP-convnext_xxlarge-laion2B-s34B-b82K-augreg-soup',
-        hf_hub_filename='open_clip_pytorch_model.bin',
+        hf_hub_id='timm/',
         mean=OPENAI_CLIP_MEAN, std=OPENAI_CLIP_STD,
         input_size=(3, 256, 256), pool_size=(8, 8), crop_pct=1.0, num_classes=1024),
     'convnext_xxlarge.clip_laion2b_rewind': _cfg(
-        hf_hub_id='laion/CLIP-convnext_xxlarge-laion2B-s34B-b82K-augreg-rewind',
-        hf_hub_filename='open_clip_pytorch_model.bin',
+        hf_hub_id='timm/',
         mean=OPENAI_CLIP_MEAN, std=OPENAI_CLIP_STD,
         input_size=(3, 256, 256), pool_size=(8, 8), crop_pct=1.0, num_classes=1024),
+
+    # NOTE dinov3 convnext weights are under a specific license, and downstream outputs must be shared with this
+    # https://ai.meta.com/resources/models-and-libraries/dinov3-license/
+    'convnext_tiny.dinov3_lvd1689m': _cfg(
+        hf_hub_id='timm/',
+        crop_pct=1.0,
+        num_classes=0,
+        license='dinov3-license',
+    ),
+    'convnext_small.dinov3_lvd1689m': _cfg(
+        hf_hub_id='timm/',
+        crop_pct=1.0,
+        num_classes=0,
+        license='dinov3-license',
+    ),
+    'convnext_base.dinov3_lvd1689m': _cfg(
+        hf_hub_id='timm/',
+        crop_pct=1.0,
+        num_classes=0,
+        license='dinov3-license',
+    ),
+    'convnext_large.dinov3_lvd1689m': _cfg(
+        hf_hub_id='timm/',
+        crop_pct=1.0,
+        num_classes=0,
+        license='dinov3-license',
+    ),
+    'convnext_tiny.eupe_lvd1689m': _cfg(
+        hf_hub_id='timm/',
+        input_size=(3, 256, 256),
+        pool_size=(8, 8),
+        crop_pct=1.0,
+        num_classes=0,
+        license='fair-noncommercial-research-license',
+    ),
+    'convnext_small.eupe_lvd1689m': _cfg(
+        hf_hub_id='timm/',
+        input_size=(3, 256, 256),
+        pool_size=(8, 8),
+        crop_pct=1.0,
+        num_classes=0,
+        license='fair-noncommercial-research-license',
+    ),
+    'convnext_base.eupe_lvd1689m': _cfg(
+        hf_hub_id='timm/',
+        input_size=(3, 256, 256),
+        pool_size=(8, 8),
+        crop_pct=1.0,
+        num_classes=0,
+        license='fair-noncommercial-research-license',
+    ),
+
+    "test_convnext.r160_in1k": _cfg(
+        hf_hub_id='timm/',
+        mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5),
+        input_size=(3, 160, 160), pool_size=(5, 5), crop_pct=0.95),
+    "test_convnext2.r160_in1k": _cfg(
+        hf_hub_id='timm/',
+        mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5),
+        input_size=(3, 160, 160), pool_size=(5, 5), crop_pct=0.95),
+    "test_convnext3.r160_in1k": _cfg(
+        hf_hub_id='timm/',
+        mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5),
+        input_size=(3, 160, 160), pool_size=(5, 5), crop_pct=0.95),
+
 })
+
+
+@register_model
+def convnext_zepto_rms(pretrained=False, **kwargs) -> ConvNeXt:
+    # timm femto variant (NOTE: still tweaking depths, will vary between 3-4M param, current is 3.7M
+    model_args = dict(depths=(2, 2, 4, 2), dims=(32, 64, 128, 256), conv_mlp=True, norm_layer='simplenorm')
+    model = _create_convnext('convnext_zepto_rms', pretrained=pretrained, **dict(model_args, **kwargs))
+    return model
+
+
+@register_model
+def convnext_zepto_rms_ols(pretrained=False, **kwargs) -> ConvNeXt:
+    # timm femto variant (NOTE: still tweaking depths, will vary between 3-4M param, current is 3.7M
+    model_args = dict(
+        depths=(2, 2, 4, 2), dims=(32, 64, 128, 256), conv_mlp=True, norm_layer='simplenorm', stem_type='overlap_act')
+    model = _create_convnext('convnext_zepto_rms_ols', pretrained=pretrained, **dict(model_args, **kwargs))
+    return model
 
 
 @register_model
@@ -965,6 +1208,14 @@ def convnext_atto_ols(pretrained=False, **kwargs) -> ConvNeXt:
     # timm femto variant with overlapping 3x3 conv stem, wider than non-ols femto above, current param count 3.7M
     model_args = dict(depths=(2, 2, 6, 2), dims=(40, 80, 160, 320), conv_mlp=True, stem_type='overlap_tiered')
     model = _create_convnext('convnext_atto_ols', pretrained=pretrained, **dict(model_args, **kwargs))
+    return model
+
+
+@register_model
+def convnext_atto_rms(pretrained=False, **kwargs) -> ConvNeXt:
+    # timm femto variant (NOTE: still tweaking depths, will vary between 3-4M param, current is 3.7M
+    model_args = dict(depths=(2, 2, 6, 2), dims=(40, 80, 160, 320), conv_mlp=True, norm_layer='rmsnorm2d')
+    model = _create_convnext('convnext_atto_rms', pretrained=pretrained, **dict(model_args, **kwargs))
     return model
 
 
@@ -1142,6 +1393,29 @@ def convnextv2_huge(pretrained=False, **kwargs) -> ConvNeXt:
     model_args = dict(depths=[3, 3, 27, 3], dims=[352, 704, 1408, 2816], use_grn=True, ls_init_value=None)
     model = _create_convnext('convnextv2_huge', pretrained=pretrained, **dict(model_args, **kwargs))
     return model
+
+
+@register_model
+def test_convnext(pretrained=False, **kwargs) -> ConvNeXt:
+    model_args = dict(depths=[1, 2, 4, 2], dims=[24, 32, 48, 64], norm_eps=kwargs.pop('norm_eps', 1e-5), act_layer='gelu_tanh')
+    model = _create_convnext('test_convnext', pretrained=pretrained, **dict(model_args, **kwargs))
+    return model
+
+
+@register_model
+def test_convnext2(pretrained=False, **kwargs) -> ConvNeXt:
+    model_args = dict(depths=[1, 1, 1, 1], dims=[32, 64, 96, 128], norm_eps=kwargs.pop('norm_eps', 1e-5), act_layer='gelu_tanh')
+    model = _create_convnext('test_convnext2', pretrained=pretrained, **dict(model_args, **kwargs))
+    return model
+
+
+@register_model
+def test_convnext3(pretrained=False, **kwargs) -> ConvNeXt:
+    model_args = dict(
+        depths=[1, 1, 1, 1], dims=[32, 64, 96, 128], norm_eps=kwargs.pop('norm_eps', 1e-5), kernel_sizes=(7, 5, 5, 3), act_layer='silu')
+    model = _create_convnext('test_convnext3', pretrained=pretrained, **dict(model_args, **kwargs))
+    return model
+
 
 
 register_model_deprecations(__name__, {

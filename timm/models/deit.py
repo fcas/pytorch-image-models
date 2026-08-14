@@ -11,7 +11,7 @@ Modifications copyright 2021, Ross Wightman
 # Copyright (c) 2015-present, Facebook, Inc.
 # All rights reserved.
 from functools import partial
-from typing import Optional
+from typing import Optional, Type
 
 import torch
 from torch import nn as nn
@@ -36,19 +36,24 @@ class VisionTransformerDistilled(VisionTransformer):
         weight_init = kwargs.pop('weight_init', '')
         super().__init__(*args, **kwargs, weight_init='skip')
         assert self.global_pool in ('token',)
+        dd = {'device': kwargs.get('device', None), 'dtype': kwargs.get('dtype', None)}
 
         self.num_prefix_tokens = 2
-        self.dist_token = nn.Parameter(torch.zeros(1, 1, self.embed_dim))
+        self.dist_token = nn.Parameter(torch.empty(1, 1, self.embed_dim, **dd))
         self.pos_embed = nn.Parameter(
-            torch.zeros(1, self.patch_embed.num_patches + self.num_prefix_tokens, self.embed_dim))
-        self.head_dist = nn.Linear(self.embed_dim, self.num_classes) if self.num_classes > 0 else nn.Identity()
+            torch.empty(1, self.patch_embed.num_patches + self.num_prefix_tokens, self.embed_dim, **dd))
+        self.head_dist = nn.Linear(self.embed_dim, self.num_classes, **dd) if self.num_classes > 0 else nn.Identity()
         self.distilled_training = False  # must set this True to train w/ distillation token
 
-        self.init_weights(weight_init)
+        self.weight_init_mode = 'reset' if weight_init == 'skip' else weight_init
+        # TODO: skip init when on meta device when safe to do so
+        if weight_init != 'skip':
+            self.init_weights(needs_reset=False)
 
-    def init_weights(self, mode=''):
+    def init_weights(self, mode='', needs_reset=True):
+        mode = mode or self.weight_init_mode
         trunc_normal_(self.dist_token, std=.02)
-        super().init_weights(mode=mode)
+        super().init_weights(mode=mode, needs_reset=needs_reset)
 
     @torch.jit.ignore
     def group_matcher(self, coarse=False):
@@ -60,7 +65,7 @@ class VisionTransformerDistilled(VisionTransformer):
         )
 
     @torch.jit.ignore
-    def get_classifier(self):
+    def get_classifier(self) -> nn.Module:
         return self.head, self.head_dist
 
     def reset_classifier(self, num_classes: int, global_pool: Optional[str] = None):
@@ -75,9 +80,11 @@ class VisionTransformerDistilled(VisionTransformer):
     def _pos_embed(self, x):
         if self.dynamic_img_size:
             B, H, W, C = x.shape
+            prev_grid_size = self.patch_embed.grid_size
             pos_embed = resample_abs_pos_embed(
                 self.pos_embed,
-                (H, W),
+                new_size=(H, W),
+                old_size=prev_grid_size,
                 num_prefix_tokens=0 if self.no_embed_class else self.num_prefix_tokens,
             )
             x = x.view(B, -1, C)
@@ -138,6 +145,7 @@ def _cfg(url='', **kwargs):
         'crop_pct': .9, 'interpolation': 'bicubic', 'fixed_input_size': True,
         'mean': IMAGENET_DEFAULT_MEAN, 'std': IMAGENET_DEFAULT_STD,
         'first_conv': 'patch_embed.proj', 'classifier': 'head',
+        'license': 'apache-2.0',
         **kwargs
     }
 

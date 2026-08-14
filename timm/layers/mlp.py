@@ -3,6 +3,7 @@
 Hacked together by / Copyright 2020 Ross Wightman
 """
 from functools import partial
+from typing import Optional, Type, Union, Tuple
 
 from torch import nn as nn
 
@@ -12,18 +13,23 @@ from .helpers import to_2tuple
 
 class Mlp(nn.Module):
     """ MLP as used in Vision Transformer, MLP-Mixer and related networks
+
+    NOTE: When use_conv=True, expects 2D NCHW tensors, otherwise N*C expected.
     """
     def __init__(
             self,
-            in_features,
-            hidden_features=None,
-            out_features=None,
-            act_layer=nn.GELU,
-            norm_layer=None,
-            bias=True,
-            drop=0.,
-            use_conv=False,
+            in_features: int,
+            hidden_features: Optional[int] = None,
+            out_features: Optional[int] = None,
+            act_layer: Type[nn.Module] = nn.GELU,
+            norm_layer: Optional[Type[nn.Module]] = None,
+            bias: Union[bool, Tuple[bool, bool]] = True,
+            drop: Union[float, Tuple[float, float]] = 0.,
+            use_conv: bool = False,
+            device=None,
+            dtype=None,
     ):
+        dd = {'device': device, 'dtype': dtype}
         super().__init__()
         out_features = out_features or in_features
         hidden_features = hidden_features or in_features
@@ -31,11 +37,11 @@ class Mlp(nn.Module):
         drop_probs = to_2tuple(drop)
         linear_layer = partial(nn.Conv2d, kernel_size=1) if use_conv else nn.Linear
 
-        self.fc1 = linear_layer(in_features, hidden_features, bias=bias[0])
+        self.fc1 = linear_layer(in_features, hidden_features, bias=bias[0], **dd)
         self.act = act_layer()
         self.drop1 = nn.Dropout(drop_probs[0])
-        self.norm = norm_layer(hidden_features) if norm_layer is not None else nn.Identity()
-        self.fc2 = linear_layer(hidden_features, out_features, bias=bias[1])
+        self.norm = norm_layer(hidden_features, **dd) if norm_layer is not None else nn.Identity()
+        self.fc2 = linear_layer(hidden_features, out_features, bias=bias[1], **dd)
         self.drop2 = nn.Dropout(drop_probs[1])
 
     def forward(self, x):
@@ -51,19 +57,24 @@ class Mlp(nn.Module):
 class GluMlp(nn.Module):
     """ MLP w/ GLU style gating
     See: https://arxiv.org/abs/1612.08083, https://arxiv.org/abs/2002.05202
+
+    NOTE: When use_conv=True, expects 2D NCHW tensors, otherwise N*C expected.
     """
     def __init__(
             self,
-            in_features,
-            hidden_features=None,
-            out_features=None,
-            act_layer=nn.Sigmoid,
-            norm_layer=None,
-            bias=True,
-            drop=0.,
-            use_conv=False,
-            gate_last=True,
+            in_features: int,
+            hidden_features: Optional[int] = None,
+            out_features: Optional[int] = None,
+            act_layer: Type[nn.Module] = nn.Sigmoid,
+            norm_layer: Optional[Type[nn.Module]] = None,
+            bias: Union[bool, Tuple[bool, bool]] = True,
+            drop: Union[float, Tuple[float, float]] = 0.,
+            use_conv: bool = False,
+            gate_last: bool = True,
+            device=None,
+            dtype=None,
     ):
+        dd = {'device': device, 'dtype': dtype}
         super().__init__()
         out_features = out_features or in_features
         hidden_features = hidden_features or in_features
@@ -74,18 +85,18 @@ class GluMlp(nn.Module):
         self.chunk_dim = 1 if use_conv else -1
         self.gate_last = gate_last  # use second half of width for gate
 
-        self.fc1 = linear_layer(in_features, hidden_features, bias=bias[0])
+        self.fc1 = linear_layer(in_features, hidden_features, bias=bias[0], **dd)
         self.act = act_layer()
         self.drop1 = nn.Dropout(drop_probs[0])
-        self.norm = norm_layer(hidden_features // 2) if norm_layer is not None else nn.Identity()
-        self.fc2 = linear_layer(hidden_features // 2, out_features, bias=bias[1])
+        self.norm = norm_layer(hidden_features // 2, **dd) if norm_layer is not None else nn.Identity()
+        self.fc2 = linear_layer(hidden_features // 2, out_features, bias=bias[1], **dd)
         self.drop2 = nn.Dropout(drop_probs[1])
 
     def init_weights(self):
         # override init of fc1 w/ gate portion set to weight near zero, bias=1
-        fc1_mid = self.fc1.bias.shape[0] // 2
-        nn.init.ones_(self.fc1.bias[fc1_mid:])
-        nn.init.normal_(self.fc1.weight[fc1_mid:], std=1e-6)
+        if self.fc1.bias is not None:
+            nn.init.ones_(self.fc1.bias[self.fc1.bias.shape[0] // 2:])
+        nn.init.normal_(self.fc1.weight[self.fc1.weight.shape[0] // 2:], std=1e-6)
 
     def forward(self, x):
         x = self.fc1(x)
@@ -108,31 +119,39 @@ class SwiGLU(nn.Module):
     """
     def __init__(
             self,
-            in_features,
-            hidden_features=None,
-            out_features=None,
-            act_layer=nn.SiLU,
-            norm_layer=None,
-            bias=True,
-            drop=0.,
+            in_features: int,
+            hidden_features: Optional[int] = None,
+            out_features: Optional[int] = None,
+            act_layer: Type[nn.Module] = nn.SiLU,
+            norm_layer: Optional[Type[nn.Module]] = None,
+            bias: Union[bool, Tuple[bool, bool]] = True,
+            drop: Union[float, Tuple[float, float]] = 0.,
+            align_to: int = 0,
+            device=None,
+            dtype=None,
     ):
+        dd = {'device': device, 'dtype': dtype}
         super().__init__()
         out_features = out_features or in_features
         hidden_features = hidden_features or in_features
         bias = to_2tuple(bias)
         drop_probs = to_2tuple(drop)
 
-        self.fc1_g = nn.Linear(in_features, hidden_features, bias=bias[0])
-        self.fc1_x = nn.Linear(in_features, hidden_features, bias=bias[0])
+        if align_to:
+            hidden_features = hidden_features + (-hidden_features % align_to)
+
+        self.fc1_g = nn.Linear(in_features, hidden_features, bias=bias[0], **dd)
+        self.fc1_x = nn.Linear(in_features, hidden_features, bias=bias[0], **dd)
         self.act = act_layer()
         self.drop1 = nn.Dropout(drop_probs[0])
-        self.norm = norm_layer(hidden_features) if norm_layer is not None else nn.Identity()
-        self.fc2 = nn.Linear(hidden_features, out_features, bias=bias[1])
+        self.norm = norm_layer(hidden_features, **dd) if norm_layer is not None else nn.Identity()
+        self.fc2 = nn.Linear(hidden_features, out_features, bias=bias[1], **dd)
         self.drop2 = nn.Dropout(drop_probs[1])
 
     def init_weights(self):
         # override init of fc1 w/ gate portion set to weight near zero, bias=1
-        nn.init.ones_(self.fc1_g.bias)
+        if self.fc1_g.bias is not None:
+            nn.init.ones_(self.fc1_g.bias)
         nn.init.normal_(self.fc1_g.weight, std=1e-6)
 
     def forward(self, x):
@@ -151,32 +170,35 @@ class GatedMlp(nn.Module):
     """
     def __init__(
             self,
-            in_features,
-            hidden_features=None,
-            out_features=None,
-            act_layer=nn.GELU,
-            norm_layer=None,
-            gate_layer=None,
-            bias=True,
-            drop=0.,
+            in_features: int,
+            hidden_features: Optional[int] = None,
+            out_features: Optional[int] = None,
+            act_layer: Type[nn.Module] = nn.GELU,
+            norm_layer: Optional[Type[nn.Module]] = None,
+            gate_layer: Optional[Type[nn.Module]] = None,
+            bias: Union[bool, Tuple[bool, bool]] = True,
+            drop: Union[float, Tuple[float, float]] = 0.,
+            device=None,
+            dtype=None,
     ):
+        dd = {'device': device, 'dtype': dtype}
         super().__init__()
         out_features = out_features or in_features
         hidden_features = hidden_features or in_features
         bias = to_2tuple(bias)
         drop_probs = to_2tuple(drop)
 
-        self.fc1 = nn.Linear(in_features, hidden_features, bias=bias[0])
+        self.fc1 = nn.Linear(in_features, hidden_features, bias=bias[0], **dd)
         self.act = act_layer()
         self.drop1 = nn.Dropout(drop_probs[0])
         if gate_layer is not None:
             assert hidden_features % 2 == 0
-            self.gate = gate_layer(hidden_features)
+            self.gate = gate_layer(hidden_features, **dd)
             hidden_features = hidden_features // 2  # FIXME base reduction on gate property?
         else:
             self.gate = nn.Identity()
-        self.norm = norm_layer(hidden_features) if norm_layer is not None else nn.Identity()
-        self.fc2 = nn.Linear(hidden_features, out_features, bias=bias[1])
+        self.norm = norm_layer(hidden_features, **dd) if norm_layer is not None else nn.Identity()
+        self.fc2 = nn.Linear(hidden_features, out_features, bias=bias[1], **dd)
         self.drop2 = nn.Dropout(drop_probs[1])
 
     def forward(self, x):
@@ -191,28 +213,31 @@ class GatedMlp(nn.Module):
 
 
 class ConvMlp(nn.Module):
-    """ MLP using 1x1 convs that keeps spatial dims
+    """ MLP using 1x1 convs that keeps spatial dims (for 2D NCHW tensors)
     """
     def __init__(
             self,
-            in_features,
-            hidden_features=None,
-            out_features=None,
-            act_layer=nn.ReLU,
-            norm_layer=None,
-            bias=True,
-            drop=0.,
+            in_features: int,
+            hidden_features: Optional[int] = None,
+            out_features: Optional[int] = None,
+            act_layer: Type[nn.Module] = nn.ReLU,
+            norm_layer: Optional[Type[nn.Module]] = None,
+            bias: Union[bool, Tuple[bool, bool]] = True,
+            drop: float = 0.,
+            device=None,
+            dtype=None,
     ):
+        dd = {'device': device, 'dtype': dtype}
         super().__init__()
         out_features = out_features or in_features
         hidden_features = hidden_features or in_features
         bias = to_2tuple(bias)
 
-        self.fc1 = nn.Conv2d(in_features, hidden_features, kernel_size=1, bias=bias[0])
-        self.norm = norm_layer(hidden_features) if norm_layer else nn.Identity()
+        self.fc1 = nn.Conv2d(in_features, hidden_features, kernel_size=1, bias=bias[0], **dd)
+        self.norm = norm_layer(hidden_features, **dd) if norm_layer else nn.Identity()
         self.act = act_layer()
         self.drop = nn.Dropout(drop)
-        self.fc2 = nn.Conv2d(hidden_features, out_features, kernel_size=1, bias=bias[1])
+        self.fc2 = nn.Conv2d(hidden_features, out_features, kernel_size=1, bias=bias[1], **dd)
 
     def forward(self, x):
         x = self.fc1(x)
@@ -225,17 +250,22 @@ class ConvMlp(nn.Module):
 
 class GlobalResponseNormMlp(nn.Module):
     """ MLP w/ Global Response Norm (see grn.py), nn.Linear or 1x1 Conv2d
+
+    NOTE: Intended for '2D' NCHW (use_conv=True) or NHWC (use_conv=False, channels-last) tensor layouts
     """
     def __init__(
             self,
-            in_features,
-            hidden_features=None,
-            out_features=None,
-            act_layer=nn.GELU,
-            bias=True,
-            drop=0.,
-            use_conv=False,
+            in_features: int,
+            hidden_features: Optional[int] = None,
+            out_features: Optional[int] = None,
+            act_layer: Type[nn.Module] = nn.GELU,
+            bias: Union[bool, Tuple[bool, bool]] = True,
+            drop: Union[float, Tuple[float, float]] = 0.,
+            use_conv: bool = False,
+            device=None,
+            dtype=None,
     ):
+        dd = {'device': device, 'dtype': dtype}
         super().__init__()
         out_features = out_features or in_features
         hidden_features = hidden_features or in_features
@@ -243,11 +273,11 @@ class GlobalResponseNormMlp(nn.Module):
         drop_probs = to_2tuple(drop)
         linear_layer = partial(nn.Conv2d, kernel_size=1) if use_conv else nn.Linear
 
-        self.fc1 = linear_layer(in_features, hidden_features, bias=bias[0])
+        self.fc1 = linear_layer(in_features, hidden_features, bias=bias[0], **dd)
         self.act = act_layer()
         self.drop1 = nn.Dropout(drop_probs[0])
-        self.grn = GlobalResponseNorm(hidden_features, channels_last=not use_conv)
-        self.fc2 = linear_layer(hidden_features, out_features, bias=bias[1])
+        self.grn = GlobalResponseNorm(hidden_features, channels_last=not use_conv, **dd)
+        self.fc2 = linear_layer(hidden_features, out_features, bias=bias[1], **dd)
         self.drop2 = nn.Dropout(drop_probs[1])
 
     def forward(self, x):

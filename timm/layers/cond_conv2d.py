@@ -8,11 +8,13 @@ Hacked together by / Copyright 2020 Ross Wightman
 
 import math
 from functools import partial
-import numpy as np
+from typing import Union, Tuple
+
 import torch
 from torch import nn as nn
 from torch.nn import functional as F
 
+from ._fx import register_notrace_module
 from .helpers import to_2tuple
 from .conv2d_same import conv2d_same
 from .padding import get_padding_value
@@ -21,7 +23,7 @@ from .padding import get_padding_value
 def get_condconv_initializer(initializer, num_experts, expert_shape):
     def condconv_initializer(weight):
         """CondConv initializer function."""
-        num_params = np.prod(expert_shape)
+        num_params = math.prod(expert_shape)
         if (len(weight.shape) != 2 or weight.shape[0] != num_experts or
                 weight.shape[1] != num_params):
             raise (ValueError(
@@ -31,6 +33,7 @@ def get_condconv_initializer(initializer, num_experts, expert_shape):
     return condconv_initializer
 
 
+@register_notrace_module
 class CondConv2d(nn.Module):
     """ Conditionally Parameterized Convolution
     Inspired by: https://github.com/tensorflow/tpu/blob/master/models/official/efficientnet/condconv/condconv_layers.py
@@ -40,9 +43,22 @@ class CondConv2d(nn.Module):
     """
     __constants__ = ['in_channels', 'out_channels', 'dynamic_padding']
 
-    def __init__(self, in_channels, out_channels, kernel_size=3,
-                 stride=1, padding='', dilation=1, groups=1, bias=False, num_experts=4):
-        super(CondConv2d, self).__init__()
+    def __init__(
+            self,
+            in_channels: int,
+            out_channels: int,
+            kernel_size: Union[int, Tuple[int, int]] = 3,
+            stride: Union[int, Tuple[int, int]] = 1,
+            padding: Union[int, Tuple[int, int], str] = '',
+            dilation: Union[int, Tuple[int, int]] = 1,
+            groups: int = 1,
+            bias: bool = False,
+            num_experts: int = 4,
+            device=None,
+            dtype=None,
+    ):
+        dd = {'device': device, 'dtype': dtype}
+        super().__init__()
 
         self.in_channels = in_channels
         self.out_channels = out_channels
@@ -60,11 +76,11 @@ class CondConv2d(nn.Module):
         weight_num_param = 1
         for wd in self.weight_shape:
             weight_num_param *= wd
-        self.weight = torch.nn.Parameter(torch.Tensor(self.num_experts, weight_num_param))
+        self.weight = torch.nn.Parameter(torch.empty(self.num_experts, weight_num_param, **dd))
 
         if bias:
             self.bias_shape = (self.out_channels,)
-            self.bias = torch.nn.Parameter(torch.Tensor(self.num_experts, self.out_channels))
+            self.bias = torch.nn.Parameter(torch.empty(self.num_experts, self.out_channels, **dd))
         else:
             self.register_parameter('bias', None)
 
@@ -75,7 +91,7 @@ class CondConv2d(nn.Module):
             partial(nn.init.kaiming_uniform_, a=math.sqrt(5)), self.num_experts, self.weight_shape)
         init_weight(self.weight)
         if self.bias is not None:
-            fan_in = np.prod(self.weight_shape[1:])
+            fan_in = math.prod(self.weight_shape[1:])
             bound = 1 / math.sqrt(fan_in)
             init_bias = get_condconv_initializer(
                 partial(nn.init.uniform_, a=-bound, b=bound), self.num_experts, self.bias_shape)

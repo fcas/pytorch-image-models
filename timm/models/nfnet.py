@@ -19,13 +19,13 @@ Hacked together by / copyright Ross Wightman, 2021.
 from collections import OrderedDict
 from dataclasses import dataclass, replace
 from functools import partial
-from typing import Callable, Tuple, Optional
+from typing import Any, Callable, Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
 
 from timm.data import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
-from timm.layers import ClassifierHead, DropPath, AvgPool2dSame, ScaledStdConv2d, ScaledStdConv2dSame, \
+from timm.layers import ClassifierHead, DropPath, calculate_drop_path_rates, AvgPool2dSame, ScaledStdConv2d, ScaledStdConv2dSame, \
     get_act_layer, get_act_fn, get_attn, make_divisible
 from ._builder import build_model_with_cfg
 from ._features_fx import register_notrace_module
@@ -37,6 +37,7 @@ __all__ = ['NormFreeNet', 'NfCfg']  # model_registry will add each entrypoint fn
 
 @dataclass
 class NfCfg:
+    """Configuration for Normalization-Free Networks."""
     depths: Tuple[int, int, int, int]
     channels: Tuple[int, int, int, int]
     alpha: float = 0.2
@@ -44,7 +45,7 @@ class NfCfg:
     stem_chs: Optional[int] = None
     group_size: Optional[int] = None
     attn_layer: Optional[str] = None
-    attn_kwargs: dict = None
+    attn_kwargs: Optional[Dict[str, Any]] = None
     attn_gain: float = 2.0  # NF correction gain to apply if attn layer is used
     width_factor: float = 1.0
     bottle_ratio: float = 0.5
@@ -61,23 +62,51 @@ class NfCfg:
 
 
 class GammaAct(nn.Module):
-    def __init__(self, act_type='relu', gamma: float = 1.0, inplace=False):
+    """Activation function with gamma scaling factor."""
+
+    def __init__(self, act_type: str = 'relu', gamma: float = 1.0, inplace: bool = False):
+        """Initialize GammaAct.
+
+        Args:
+            act_type: Type of activation function.
+            gamma: Scaling factor for activation output.
+            inplace: Whether to perform activation in-place.
+        """
         super().__init__()
         self.act_fn = get_act_fn(act_type)
         self.gamma = gamma
         self.inplace = inplace
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass.
+
+        Args:
+            x: Input tensor.
+
+        Returns:
+            Scaled activation output.
+        """
         return self.act_fn(x, inplace=self.inplace).mul_(self.gamma)
 
 
-def act_with_gamma(act_type, gamma: float = 1.):
-    def _create(inplace=False):
+def act_with_gamma(act_type: str, gamma: float = 1.) -> Callable:
+    """Create activation function factory with gamma scaling.
+
+    Args:
+        act_type: Type of activation function.
+        gamma: Scaling factor for activation output.
+
+    Returns:
+        Activation function factory.
+    """
+    def _create(inplace: bool = False) -> GammaAct:
         return GammaAct(act_type, gamma=gamma, inplace=inplace)
     return _create
 
 
 class DownsampleAvg(nn.Module):
+    """AvgPool downsampling as in 'D' ResNet variants with dilation support."""
+
     def __init__(
             self,
             in_chs: int,
@@ -86,18 +115,37 @@ class DownsampleAvg(nn.Module):
             dilation: int = 1,
             first_dilation: Optional[int] = None,
             conv_layer: Callable = ScaledStdConv2d,
+            device=None,
+            dtype=None,
     ):
-        """ AvgPool Downsampling as in 'D' ResNet variants. Support for dilation."""
-        super(DownsampleAvg, self).__init__()
+        """Initialize DownsampleAvg.
+
+        Args:
+            in_chs: Input channels.
+            out_chs: Output channels.
+            stride: Stride for downsampling.
+            dilation: Dilation rate.
+            first_dilation: First dilation rate (unused).
+            conv_layer: Convolution layer type.
+        """
+        super().__init__()
         avg_stride = stride if dilation == 1 else 1
         if stride > 1 or dilation > 1:
             avg_pool_fn = AvgPool2dSame if avg_stride == 1 and dilation > 1 else nn.AvgPool2d
             self.pool = avg_pool_fn(2, avg_stride, ceil_mode=True, count_include_pad=False)
         else:
             self.pool = nn.Identity()
-        self.conv = conv_layer(in_chs, out_chs, 1, stride=1)
+        self.conv = conv_layer(in_chs, out_chs, 1, stride=1, device=device, dtype=dtype)
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass.
+
+        Args:
+            x: Input tensor.
+
+        Returns:
+            Downsampled tensor.
+        """
         return self.conv(self.pool(x))
 
 
@@ -122,11 +170,36 @@ class NormFreeBlock(nn.Module):
             extra_conv: bool = False,
             skipinit: bool = False,
             attn_layer: Optional[Callable] = None,
-            attn_gain: bool = 2.0,
+            attn_gain: float = 2.0,
             act_layer: Optional[Callable] = None,
             conv_layer: Callable = ScaledStdConv2d,
             drop_path_rate: float = 0.,
+            device=None,
+            dtype=None,
     ):
+        """Initialize NormFreeBlock.
+
+        Args:
+            in_chs: Input channels.
+            out_chs: Output channels.
+            stride: Stride for convolution.
+            dilation: Dilation rate.
+            first_dilation: First dilation rate.
+            alpha: Alpha scaling factor for residual.
+            beta: Beta scaling factor for pre-activation.
+            bottle_ratio: Bottleneck ratio.
+            group_size: Group convolution size.
+            ch_div: Channel divisor for rounding.
+            reg: Use RegNet-style configuration.
+            extra_conv: Add extra 3x3 convolution.
+            skipinit: Use skipinit initialization.
+            attn_layer: Attention layer type.
+            attn_gain: Attention gain factor.
+            act_layer: Activation layer type.
+            conv_layer: Convolution layer type.
+            drop_path_rate: Stochastic depth drop rate.
+        """
+        dd = {'device': device, 'dtype': dtype}
         super().__init__()
         first_dilation = first_dilation or dilation
         out_chs = out_chs or in_chs
@@ -147,34 +220,43 @@ class NormFreeBlock(nn.Module):
                 dilation=dilation,
                 first_dilation=first_dilation,
                 conv_layer=conv_layer,
+                **dd,
             )
         else:
             self.downsample = None
 
         self.act1 = act_layer()
-        self.conv1 = conv_layer(in_chs, mid_chs, 1)
+        self.conv1 = conv_layer(in_chs, mid_chs, 1, **dd)
         self.act2 = act_layer(inplace=True)
-        self.conv2 = conv_layer(mid_chs, mid_chs, 3, stride=stride, dilation=first_dilation, groups=groups)
+        self.conv2 = conv_layer(mid_chs, mid_chs, 3, stride=stride, dilation=first_dilation, groups=groups, **dd)
         if extra_conv:
             self.act2b = act_layer(inplace=True)
-            self.conv2b = conv_layer(mid_chs, mid_chs, 3, stride=1, dilation=dilation, groups=groups)
+            self.conv2b = conv_layer(mid_chs, mid_chs, 3, stride=1, dilation=dilation, groups=groups, **dd)
         else:
             self.act2b = None
             self.conv2b = None
         if reg and attn_layer is not None:
-            self.attn = attn_layer(mid_chs)  # RegNet blocks apply attn btw conv2 & 3
+            self.attn = attn_layer(mid_chs, **dd)  # RegNet blocks apply attn btw conv2 & 3
         else:
             self.attn = None
         self.act3 = act_layer()
-        self.conv3 = conv_layer(mid_chs, out_chs, 1, gain_init=1. if skipinit else 0.)
+        self.conv3 = conv_layer(mid_chs, out_chs, 1, gain_init=1. if skipinit else 0., **dd)
         if not reg and attn_layer is not None:
-            self.attn_last = attn_layer(out_chs)  # ResNet blocks apply attn after conv3
+            self.attn_last = attn_layer(out_chs, **dd)  # ResNet blocks apply attn after conv3
         else:
             self.attn_last = None
         self.drop_path = DropPath(drop_path_rate) if drop_path_rate > 0 else nn.Identity()
-        self.skipinit_gain = nn.Parameter(torch.tensor(0.)) if skipinit else None
+        self.skipinit_gain = nn.Parameter(torch.tensor(0., **dd)) if skipinit else None
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass.
+
+        Args:
+            x: Input tensor.
+
+        Returns:
+            Output tensor.
+        """
         out = self.act1(x) * self.beta
 
         # shortcut branch
@@ -207,7 +289,23 @@ def create_stem(
         conv_layer: Optional[Callable] = None,
         act_layer: Optional[Callable] = None,
         preact_feature: bool = True,
-):
+        device=None,
+        dtype=None,
+) -> Tuple[nn.Sequential, int, Dict[str, Any]]:
+    """Create stem module for NFNet models.
+
+    Args:
+        in_chs: Input channels.
+        out_chs: Output channels.
+        stem_type: Type of stem ('', 'deep', 'deep_tiered', 'deep_quad', '3x3', '7x7', etc.).
+        conv_layer: Convolution layer type.
+        act_layer: Activation layer type.
+        preact_feature: Use pre-activation feature.
+
+    Returns:
+        Tuple of (stem_module, stem_stride, stem_feature_info).
+    """
+    dd = {'device': device, 'dtype': dtype}
     stem_stride = 2
     stem_feature = dict(num_chs=out_chs, reduction=2, module='stem.conv')
     stem = OrderedDict()
@@ -215,7 +313,7 @@ def create_stem(
     if 'deep' in stem_type:
         if 'quad' in stem_type:
             # 4 deep conv stack as in NFNet-F models
-            assert not 'pool' in stem_type
+            assert 'pool' not in stem_type
             stem_chs = (out_chs // 8, out_chs // 4, out_chs // 2, out_chs)
             strides = (2, 1, 1, 2)
             stem_stride = 4
@@ -229,16 +327,16 @@ def create_stem(
             stem_feature = dict(num_chs=out_chs // 2, reduction=2, module='stem.conv2')
         last_idx = len(stem_chs) - 1
         for i, (c, s) in enumerate(zip(stem_chs, strides)):
-            stem[f'conv{i + 1}'] = conv_layer(in_chs, c, kernel_size=3, stride=s)
+            stem[f'conv{i + 1}'] = conv_layer(in_chs, c, kernel_size=3, stride=s, **dd)
             if i != last_idx:
                 stem[f'act{i + 2}'] = act_layer(inplace=True)
             in_chs = c
     elif '3x3' in stem_type:
         # 3x3 stem conv as in RegNet
-        stem['conv'] = conv_layer(in_chs, out_chs, kernel_size=3, stride=2)
+        stem['conv'] = conv_layer(in_chs, out_chs, kernel_size=3, stride=2, **dd)
     else:
         # 7x7 stem conv as in ResNet
-        stem['conv'] = conv_layer(in_chs, out_chs, kernel_size=7, stride=2)
+        stem['conv'] = conv_layer(in_chs, out_chs, kernel_size=7, stride=2, **dd)
 
     if 'pool' in stem_type:
         stem['pool'] = nn.MaxPool2d(3, stride=2, padding=1)
@@ -298,7 +396,9 @@ class NormFreeNet(nn.Module):
             output_stride: int = 32,
             drop_rate: float = 0.,
             drop_path_rate: float = 0.,
-            **kwargs,
+            device=None,
+            dtype=None,
+            **kwargs: Any,
     ):
         """
         Args:
@@ -312,7 +412,9 @@ class NormFreeNet(nn.Module):
             **kwargs: Extra kwargs overlayed onto cfg.
         """
         super().__init__()
+        dd = {'device': device, 'dtype': dtype}
         self.num_classes = num_classes
+        self.in_chans = in_chans
         self.drop_rate = drop_rate
         self.grad_checkpointing = False
 
@@ -334,10 +436,11 @@ class NormFreeNet(nn.Module):
             cfg.stem_type,
             conv_layer=conv_layer,
             act_layer=act_layer,
+            **dd,
         )
 
         self.feature_info = [stem_feat]
-        drop_path_rates = [x.tolist() for x in torch.linspace(0, drop_path_rate, sum(cfg.depths)).split(cfg.depths)]
+        drop_path_rates = calculate_drop_path_rates(drop_path_rate, cfg.depths, stagewise=True)
         prev_chs = stem_chs
         net_stride = stem_stride
         dilation = 1
@@ -373,6 +476,7 @@ class NormFreeNet(nn.Module):
                     act_layer=act_layer,
                     conv_layer=conv_layer,
                     drop_path_rate=drop_path_rates[stage_idx][block_idx],
+                    **dd,
                 )]
                 if block_idx == 0:
                     expected_var = 1.  # expected var is reset after first block of each stage
@@ -386,18 +490,20 @@ class NormFreeNet(nn.Module):
         if cfg.num_features:
             # The paper NFRegNet models have an EfficientNet-like final head convolution.
             self.num_features = make_divisible(cfg.width_factor * cfg.num_features, cfg.ch_div)
-            self.final_conv = conv_layer(prev_chs, self.num_features, 1)
+            self.final_conv = conv_layer(prev_chs, self.num_features, 1, **dd)
             self.feature_info[-1] = dict(num_chs=self.num_features, reduction=net_stride, module=f'final_conv')
         else:
             self.num_features = prev_chs
             self.final_conv = nn.Identity()
         self.final_act = act_layer(inplace=cfg.num_features > 0)
 
+        self.head_hidden_size = self.num_features
         self.head = ClassifierHead(
             self.num_features,
             num_classes,
             pool_type=global_pool,
             drop_rate=self.drop_rate,
+            **dd,
         )
 
         for n, m in self.named_modules():
@@ -414,7 +520,8 @@ class NormFreeNet(nn.Module):
                     nn.init.zeros_(m.bias)
 
     @torch.jit.ignore
-    def group_matcher(self, coarse=False):
+    def group_matcher(self, coarse: bool = False) -> Dict[str, Any]:
+        """Group parameters for optimization."""
         matcher = dict(
             stem=r'^stem',
             blocks=[
@@ -425,17 +532,34 @@ class NormFreeNet(nn.Module):
         return matcher
 
     @torch.jit.ignore
-    def set_grad_checkpointing(self, enable=True):
+    def set_grad_checkpointing(self, enable: bool = True) -> None:
+        """Enable or disable gradient checkpointing."""
         self.grad_checkpointing = enable
 
     @torch.jit.ignore
-    def get_classifier(self):
+    def get_classifier(self) -> nn.Module:
+        """Get the classifier head."""
         return self.head.fc
 
-    def reset_classifier(self, num_classes, global_pool='avg'):
+    def reset_classifier(self, num_classes: int, global_pool: Optional[str] = None) -> None:
+        """Reset the classifier head.
+
+        Args:
+            num_classes: Number of classes for new classifier.
+            global_pool: Global pooling type.
+        """
+        self.num_classes = num_classes
         self.head.reset(num_classes, global_pool)
 
-    def forward_features(self, x):
+    def forward_features(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass through feature extraction layers.
+
+        Args:
+            x: Input tensor.
+
+        Returns:
+            Feature tensor.
+        """
         x = self.stem(x)
         if self.grad_checkpointing and not torch.jit.is_scripting():
             x = checkpoint_seq(self.stages, x)
@@ -445,23 +569,53 @@ class NormFreeNet(nn.Module):
         x = self.final_act(x)
         return x
 
-    def forward_head(self, x, pre_logits: bool = False):
+    def forward_head(self, x: torch.Tensor, pre_logits: bool = False) -> torch.Tensor:
+        """Forward pass through classifier head.
+
+        Args:
+            x: Input features.
+            pre_logits: Return features before final linear layer.
+
+        Returns:
+            Classification logits or features.
+        """
         return self.head(x, pre_logits=pre_logits) if pre_logits else self.head(x)
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass.
+
+        Args:
+            x: Input tensor.
+
+        Returns:
+            Output logits.
+        """
         x = self.forward_features(x)
         x = self.forward_head(x)
         return x
 
 
 def _nfres_cfg(
-        depths,
-        channels=(256, 512, 1024, 2048),
-        group_size=None,
-        act_layer='relu',
-        attn_layer=None,
-        attn_kwargs=None,
-):
+        depths: Tuple[int, ...],
+        channels: Tuple[int, ...] = (256, 512, 1024, 2048),
+        group_size: Optional[int] = None,
+        act_layer: str = 'relu',
+        attn_layer: Optional[str] = None,
+        attn_kwargs: Optional[Dict[str, Any]] = None,
+) -> NfCfg:
+    """Create NFNet ResNet configuration.
+
+    Args:
+        depths: Number of blocks in each stage.
+        channels: Channel dimensions for each stage.
+        group_size: Group convolution size.
+        act_layer: Activation layer type.
+        attn_layer: Attention layer type.
+        attn_kwargs: Attention layer arguments.
+
+    Returns:
+        NFNet configuration.
+    """
     attn_kwargs = attn_kwargs or {}
     cfg = NfCfg(
         depths=depths,
@@ -477,7 +631,16 @@ def _nfres_cfg(
     return cfg
 
 
-def _nfreg_cfg(depths, channels=(48, 104, 208, 440)):
+def _nfreg_cfg(depths: Tuple[int, ...], channels: Tuple[int, ...] = (48, 104, 208, 440)) -> NfCfg:
+    """Create NFNet RegNet configuration.
+
+    Args:
+        depths: Number of blocks in each stage.
+        channels: Channel dimensions for each stage.
+
+    Returns:
+        NFNet configuration.
+    """
     num_features = 1280 * channels[-1] // 440
     attn_kwargs = dict(rd_ratio=0.5)
     cfg = NfCfg(
@@ -496,15 +659,30 @@ def _nfreg_cfg(depths, channels=(48, 104, 208, 440)):
 
 
 def _nfnet_cfg(
-        depths,
-        channels=(256, 512, 1536, 1536),
-        group_size=128,
-        bottle_ratio=0.5,
-        feat_mult=2.,
-        act_layer='gelu',
-        attn_layer='se',
-        attn_kwargs=None,
-):
+        depths: Tuple[int, ...],
+        channels: Tuple[int, ...] = (256, 512, 1536, 1536),
+        group_size: int = 128,
+        bottle_ratio: float = 0.5,
+        feat_mult: float = 2.,
+        act_layer: str = 'gelu',
+        attn_layer: str = 'se',
+        attn_kwargs: Optional[Dict[str, Any]] = None,
+) -> NfCfg:
+    """Create NFNet configuration.
+
+    Args:
+        depths: Number of blocks in each stage.
+        channels: Channel dimensions for each stage.
+        group_size: Group convolution size.
+        bottle_ratio: Bottleneck ratio.
+        feat_mult: Feature multiplier for final layer.
+        act_layer: Activation layer type.
+        attn_layer: Attention layer type.
+        attn_kwargs: Attention layer arguments.
+
+    Returns:
+        NFNet configuration.
+    """
     num_features = int(channels[-1] * feat_mult)
     attn_kwargs = attn_kwargs if attn_kwargs is not None else dict(rd_ratio=0.5)
     cfg = NfCfg(
@@ -524,11 +702,22 @@ def _nfnet_cfg(
 
 
 def _dm_nfnet_cfg(
-        depths,
-        channels=(256, 512, 1536, 1536),
-        act_layer='gelu',
-        skipinit=True,
-):
+        depths: Tuple[int, ...],
+        channels: Tuple[int, ...] = (256, 512, 1536, 1536),
+        act_layer: str = 'gelu',
+        skipinit: bool = True,
+) -> NfCfg:
+    """Create DeepMind NFNet configuration.
+
+    Args:
+        depths: Number of blocks in each stage.
+        channels: Channel dimensions for each stage.
+        act_layer: Activation layer type.
+        skipinit: Use skipinit initialization.
+
+    Returns:
+        NFNet configuration.
+    """
     cfg = NfCfg(
         depths=depths,
         channels=channels,
@@ -606,10 +795,24 @@ model_cfgs = dict(
     nf_ecaresnet26=_nfres_cfg(depths=(2, 2, 2, 2), attn_layer='eca', attn_kwargs=dict()),
     nf_ecaresnet50=_nfres_cfg(depths=(3, 4, 6, 3), attn_layer='eca', attn_kwargs=dict()),
     nf_ecaresnet101=_nfres_cfg(depths=(3, 4, 23, 3), attn_layer='eca', attn_kwargs=dict()),
+
+    test_nfnet=_nfnet_cfg(
+        depths=(1, 1, 1, 1), channels=(32, 64, 96, 128), feat_mult=1.5, group_size=8, bottle_ratio=0.25,
+        attn_kwargs=dict(rd_ratio=0.25, rd_divisor=8), act_layer='silu'),
 )
 
 
-def _create_normfreenet(variant, pretrained=False, **kwargs):
+def _create_normfreenet(variant: str, pretrained: bool = False, **kwargs: Any) -> NormFreeNet:
+    """Create a NormFreeNet model.
+
+    Args:
+        variant: Model variant name.
+        pretrained: Load pretrained weights.
+        **kwargs: Additional model arguments.
+
+    Returns:
+        NormFreeNet model instance.
+    """
     model_cfg = model_cfgs[variant]
     feature_cfg = dict(flatten_sequential=True)
     return build_model_with_cfg(
@@ -622,13 +825,22 @@ def _create_normfreenet(variant, pretrained=False, **kwargs):
     )
 
 
-def _dcfg(url='', **kwargs):
+def _dcfg(url: str = '', **kwargs: Any) -> Dict[str, Any]:
+    """Create default configuration dictionary.
+
+    Args:
+        url: Model weight URL.
+        **kwargs: Additional configuration options.
+
+    Returns:
+        Configuration dictionary.
+    """
     return {
         'url': url,
         'num_classes': 1000, 'input_size': (3, 224, 224), 'pool_size': (7, 7),
         'crop_pct': 0.9, 'interpolation': 'bicubic',
         'mean': IMAGENET_DEFAULT_MEAN, 'std': IMAGENET_DEFAULT_STD,
-        'first_conv': 'stem.conv1', 'classifier': 'head.fc',
+        'first_conv': 'stem.conv1', 'classifier': 'head.fc', 'license': 'apache-2.0',
         **kwargs
     }
 
@@ -729,302 +941,249 @@ default_cfgs = generate_default_cfgs({
     'nf_ecaresnet26': _dcfg(url='', first_conv='stem.conv'),
     'nf_ecaresnet50': _dcfg(url='', first_conv='stem.conv'),
     'nf_ecaresnet101': _dcfg(url='', first_conv='stem.conv'),
+
+    'test_nfnet.r160_in1k': _dcfg(
+        hf_hub_id='timm/',
+        mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5),
+        crop_pct=0.95, input_size=(3, 160, 160), pool_size=(5, 5)),
 })
 
 
 @register_model
-def dm_nfnet_f0(pretrained=False, **kwargs) -> NormFreeNet:
-    """ NFNet-F0 (DeepMind weight compatible)
-    `High-Performance Large-Scale Image Recognition Without Normalization`
-        - https://arxiv.org/abs/2102.06171
-    """
+def dm_nfnet_f0(pretrained: bool = False, **kwargs: Any) -> NormFreeNet:
+    """NFNet-F0 (DeepMind weight compatible)."""
     return _create_normfreenet('dm_nfnet_f0', pretrained=pretrained, **kwargs)
 
 
 @register_model
-def dm_nfnet_f1(pretrained=False, **kwargs) -> NormFreeNet:
-    """ NFNet-F1 (DeepMind weight compatible)
-    `High-Performance Large-Scale Image Recognition Without Normalization`
-        - https://arxiv.org/abs/2102.06171
-    """
+def dm_nfnet_f1(pretrained: bool = False, **kwargs: Any) -> NormFreeNet:
+    """NFNet-F1 (DeepMind weight compatible)."""
     return _create_normfreenet('dm_nfnet_f1', pretrained=pretrained, **kwargs)
 
 
 @register_model
-def dm_nfnet_f2(pretrained=False, **kwargs) -> NormFreeNet:
-    """ NFNet-F2 (DeepMind weight compatible)
-    `High-Performance Large-Scale Image Recognition Without Normalization`
-        - https://arxiv.org/abs/2102.06171
-    """
+def dm_nfnet_f2(pretrained: bool = False, **kwargs: Any) -> NormFreeNet:
+    """NFNet-F2 (DeepMind weight compatible)."""
     return _create_normfreenet('dm_nfnet_f2', pretrained=pretrained, **kwargs)
 
 
 @register_model
-def dm_nfnet_f3(pretrained=False, **kwargs) -> NormFreeNet:
-    """ NFNet-F3 (DeepMind weight compatible)
-    `High-Performance Large-Scale Image Recognition Without Normalization`
-        - https://arxiv.org/abs/2102.06171
-    """
+def dm_nfnet_f3(pretrained: bool = False, **kwargs: Any) -> NormFreeNet:
+    """NFNet-F3 (DeepMind weight compatible)."""
     return _create_normfreenet('dm_nfnet_f3', pretrained=pretrained, **kwargs)
 
 
 @register_model
-def dm_nfnet_f4(pretrained=False, **kwargs) -> NormFreeNet:
-    """ NFNet-F4 (DeepMind weight compatible)
-    `High-Performance Large-Scale Image Recognition Without Normalization`
-        - https://arxiv.org/abs/2102.06171
-    """
+def dm_nfnet_f4(pretrained: bool = False, **kwargs: Any) -> NormFreeNet:
+    """NFNet-F4 (DeepMind weight compatible)."""
     return _create_normfreenet('dm_nfnet_f4', pretrained=pretrained, **kwargs)
 
 
 @register_model
-def dm_nfnet_f5(pretrained=False, **kwargs) -> NormFreeNet:
-    """ NFNet-F5 (DeepMind weight compatible)
-    `High-Performance Large-Scale Image Recognition Without Normalization`
-        - https://arxiv.org/abs/2102.06171
-    """
+def dm_nfnet_f5(pretrained: bool = False, **kwargs: Any) -> NormFreeNet:
+    """NFNet-F5 (DeepMind weight compatible)."""
     return _create_normfreenet('dm_nfnet_f5', pretrained=pretrained, **kwargs)
 
 
 @register_model
-def dm_nfnet_f6(pretrained=False, **kwargs) -> NormFreeNet:
-    """ NFNet-F6 (DeepMind weight compatible)
-    `High-Performance Large-Scale Image Recognition Without Normalization`
-        - https://arxiv.org/abs/2102.06171
-    """
+def dm_nfnet_f6(pretrained: bool = False, **kwargs: Any) -> NormFreeNet:
+    """NFNet-F6 (DeepMind weight compatible)."""
     return _create_normfreenet('dm_nfnet_f6', pretrained=pretrained, **kwargs)
 
 
 @register_model
-def nfnet_f0(pretrained=False, **kwargs) -> NormFreeNet:
-    """ NFNet-F0
-    `High-Performance Large-Scale Image Recognition Without Normalization`
-        - https://arxiv.org/abs/2102.06171
-    """
+def nfnet_f0(pretrained: bool = False, **kwargs: Any) -> NormFreeNet:
+    """NFNet-F0."""
     return _create_normfreenet('nfnet_f0', pretrained=pretrained, **kwargs)
 
 
 @register_model
-def nfnet_f1(pretrained=False, **kwargs) -> NormFreeNet:
-    """ NFNet-F1
-    `High-Performance Large-Scale Image Recognition Without Normalization`
-        - https://arxiv.org/abs/2102.06171
-    """
+def nfnet_f1(pretrained: bool = False, **kwargs: Any) -> NormFreeNet:
+    """NFNet-F1."""
     return _create_normfreenet('nfnet_f1', pretrained=pretrained, **kwargs)
 
 
 @register_model
-def nfnet_f2(pretrained=False, **kwargs) -> NormFreeNet:
-    """ NFNet-F2
-    `High-Performance Large-Scale Image Recognition Without Normalization`
-        - https://arxiv.org/abs/2102.06171
-    """
+def nfnet_f2(pretrained: bool = False, **kwargs: Any) -> NormFreeNet:
+    """NFNet-F2."""
     return _create_normfreenet('nfnet_f2', pretrained=pretrained, **kwargs)
 
 
 @register_model
-def nfnet_f3(pretrained=False, **kwargs) -> NormFreeNet:
-    """ NFNet-F3
-    `High-Performance Large-Scale Image Recognition Without Normalization`
-        - https://arxiv.org/abs/2102.06171
-    """
+def nfnet_f3(pretrained: bool = False, **kwargs: Any) -> NormFreeNet:
+    """NFNet-F3."""
     return _create_normfreenet('nfnet_f3', pretrained=pretrained, **kwargs)
 
 
 @register_model
-def nfnet_f4(pretrained=False, **kwargs) -> NormFreeNet:
-    """ NFNet-F4
-    `High-Performance Large-Scale Image Recognition Without Normalization`
-        - https://arxiv.org/abs/2102.06171
-    """
+def nfnet_f4(pretrained: bool = False, **kwargs: Any) -> NormFreeNet:
+    """NFNet-F4."""
     return _create_normfreenet('nfnet_f4', pretrained=pretrained, **kwargs)
 
 
 @register_model
-def nfnet_f5(pretrained=False, **kwargs) -> NormFreeNet:
-    """ NFNet-F5
-    `High-Performance Large-Scale Image Recognition Without Normalization`
-        - https://arxiv.org/abs/2102.06171
-    """
+def nfnet_f5(pretrained: bool = False, **kwargs: Any) -> NormFreeNet:
+    """NFNet-F5."""
     return _create_normfreenet('nfnet_f5', pretrained=pretrained, **kwargs)
 
 
 @register_model
-def nfnet_f6(pretrained=False, **kwargs) -> NormFreeNet:
-    """ NFNet-F6
-    `High-Performance Large-Scale Image Recognition Without Normalization`
-        - https://arxiv.org/abs/2102.06171
-    """
+def nfnet_f6(pretrained: bool = False, **kwargs: Any) -> NormFreeNet:
+    """NFNet-F6."""
     return _create_normfreenet('nfnet_f6', pretrained=pretrained, **kwargs)
 
 
 @register_model
-def nfnet_f7(pretrained=False, **kwargs) -> NormFreeNet:
-    """ NFNet-F7
-    `High-Performance Large-Scale Image Recognition Without Normalization`
-        - https://arxiv.org/abs/2102.06171
-    """
+def nfnet_f7(pretrained: bool = False, **kwargs: Any) -> NormFreeNet:
+    """NFNet-F7."""
     return _create_normfreenet('nfnet_f7', pretrained=pretrained, **kwargs)
 
 
 @register_model
-def nfnet_l0(pretrained=False, **kwargs) -> NormFreeNet:
-    """ NFNet-L0b w/ SiLU
+def nfnet_l0(pretrained: bool = False, **kwargs: Any) -> NormFreeNet:
+    """NFNet-L0b w/ SiLU.
+
     My experimental 'light' model w/ F0 repeats, 1.5x final_conv mult, 64 group_size, .25 bottleneck & SE ratio
     """
     return _create_normfreenet('nfnet_l0', pretrained=pretrained, **kwargs)
 
 
 @register_model
-def eca_nfnet_l0(pretrained=False, **kwargs) -> NormFreeNet:
-    """ ECA-NFNet-L0 w/ SiLU
+def eca_nfnet_l0(pretrained: bool = False, **kwargs: Any) -> NormFreeNet:
+    """ECA-NFNet-L0 w/ SiLU.
+
     My experimental 'light' model w/ F0 repeats, 1.5x final_conv mult, 64 group_size, .25 bottleneck & ECA attn
     """
     return _create_normfreenet('eca_nfnet_l0', pretrained=pretrained, **kwargs)
 
 
 @register_model
-def eca_nfnet_l1(pretrained=False, **kwargs) -> NormFreeNet:
-    """ ECA-NFNet-L1 w/ SiLU
+def eca_nfnet_l1(pretrained: bool = False, **kwargs: Any) -> NormFreeNet:
+    """ECA-NFNet-L1 w/ SiLU.
+
     My experimental 'light' model w/ F1 repeats, 2.0x final_conv mult, 64 group_size, .25 bottleneck & ECA attn
     """
     return _create_normfreenet('eca_nfnet_l1', pretrained=pretrained, **kwargs)
 
 
 @register_model
-def eca_nfnet_l2(pretrained=False, **kwargs) -> NormFreeNet:
-    """ ECA-NFNet-L2 w/ SiLU
+def eca_nfnet_l2(pretrained: bool = False, **kwargs: Any) -> NormFreeNet:
+    """ECA-NFNet-L2 w/ SiLU.
+
     My experimental 'light' model w/ F2 repeats, 2.0x final_conv mult, 64 group_size, .25 bottleneck & ECA attn
     """
     return _create_normfreenet('eca_nfnet_l2', pretrained=pretrained, **kwargs)
 
 
 @register_model
-def eca_nfnet_l3(pretrained=False, **kwargs) -> NormFreeNet:
-    """ ECA-NFNet-L3 w/ SiLU
+def eca_nfnet_l3(pretrained: bool = False, **kwargs: Any) -> NormFreeNet:
+    """ECA-NFNet-L3 w/ SiLU.
+
     My experimental 'light' model w/ F3 repeats, 2.0x final_conv mult, 64 group_size, .25 bottleneck & ECA attn
     """
     return _create_normfreenet('eca_nfnet_l3', pretrained=pretrained, **kwargs)
 
 
 @register_model
-def nf_regnet_b0(pretrained=False, **kwargs) -> NormFreeNet:
-    """ Normalization-Free RegNet-B0
-    `Characterizing signal propagation to close the performance gap in unnormalized ResNets`
-        - https://arxiv.org/abs/2101.08692
+def nf_regnet_b0(pretrained: bool = False, **kwargs: Any) -> NormFreeNet:
+    """Normalization-Free RegNet-B0.
     """
     return _create_normfreenet('nf_regnet_b0', pretrained=pretrained, **kwargs)
 
 
 @register_model
-def nf_regnet_b1(pretrained=False, **kwargs) -> NormFreeNet:
-    """ Normalization-Free RegNet-B1
-    `Characterizing signal propagation to close the performance gap in unnormalized ResNets`
-        - https://arxiv.org/abs/2101.08692
+def nf_regnet_b1(pretrained: bool = False, **kwargs: Any) -> NormFreeNet:
+    """Normalization-Free RegNet-B1.
     """
     return _create_normfreenet('nf_regnet_b1', pretrained=pretrained, **kwargs)
 
 
 @register_model
-def nf_regnet_b2(pretrained=False, **kwargs) -> NormFreeNet:
-    """ Normalization-Free RegNet-B2
-    `Characterizing signal propagation to close the performance gap in unnormalized ResNets`
-        - https://arxiv.org/abs/2101.08692
+def nf_regnet_b2(pretrained: bool = False, **kwargs: Any) -> NormFreeNet:
+    """Normalization-Free RegNet-B2.
     """
     return _create_normfreenet('nf_regnet_b2', pretrained=pretrained, **kwargs)
 
 
 @register_model
-def nf_regnet_b3(pretrained=False, **kwargs) -> NormFreeNet:
-    """ Normalization-Free RegNet-B3
-    `Characterizing signal propagation to close the performance gap in unnormalized ResNets`
-        - https://arxiv.org/abs/2101.08692
+def nf_regnet_b3(pretrained: bool = False, **kwargs: Any) -> NormFreeNet:
+    """Normalization-Free RegNet-B3.
     """
     return _create_normfreenet('nf_regnet_b3', pretrained=pretrained, **kwargs)
 
 
 @register_model
-def nf_regnet_b4(pretrained=False, **kwargs) -> NormFreeNet:
-    """ Normalization-Free RegNet-B4
-    `Characterizing signal propagation to close the performance gap in unnormalized ResNets`
-        - https://arxiv.org/abs/2101.08692
+def nf_regnet_b4(pretrained: bool = False, **kwargs: Any) -> NormFreeNet:
+    """Normalization-Free RegNet-B4.
     """
     return _create_normfreenet('nf_regnet_b4', pretrained=pretrained, **kwargs)
 
 
 @register_model
-def nf_regnet_b5(pretrained=False, **kwargs) -> NormFreeNet:
-    """ Normalization-Free RegNet-B5
-    `Characterizing signal propagation to close the performance gap in unnormalized ResNets`
-        - https://arxiv.org/abs/2101.08692
+def nf_regnet_b5(pretrained: bool = False, **kwargs: Any) -> NormFreeNet:
+    """Normalization-Free RegNet-B5.
     """
     return _create_normfreenet('nf_regnet_b5', pretrained=pretrained, **kwargs)
 
 
 @register_model
-def nf_resnet26(pretrained=False, **kwargs) -> NormFreeNet:
-    """ Normalization-Free ResNet-26
-    `Characterizing signal propagation to close the performance gap in unnormalized ResNets`
-        - https://arxiv.org/abs/2101.08692
+def nf_resnet26(pretrained: bool = False, **kwargs: Any) -> NormFreeNet:
+    """Normalization-Free ResNet-26.
     """
     return _create_normfreenet('nf_resnet26', pretrained=pretrained, **kwargs)
 
 
 @register_model
-def nf_resnet50(pretrained=False, **kwargs) -> NormFreeNet:
-    """ Normalization-Free ResNet-50
-    `Characterizing signal propagation to close the performance gap in unnormalized ResNets`
-        - https://arxiv.org/abs/2101.08692
+def nf_resnet50(pretrained: bool = False, **kwargs: Any) -> NormFreeNet:
+    """Normalization-Free ResNet-50.
     """
     return _create_normfreenet('nf_resnet50', pretrained=pretrained, **kwargs)
 
 
 @register_model
-def nf_resnet101(pretrained=False, **kwargs) -> NormFreeNet:
-    """ Normalization-Free ResNet-101
-    `Characterizing signal propagation to close the performance gap in unnormalized ResNets`
-        - https://arxiv.org/abs/2101.08692
+def nf_resnet101(pretrained: bool = False, **kwargs: Any) -> NormFreeNet:
+    """Normalization-Free ResNet-101.
     """
     return _create_normfreenet('nf_resnet101', pretrained=pretrained, **kwargs)
 
 
 @register_model
-def nf_seresnet26(pretrained=False, **kwargs) -> NormFreeNet:
-    """ Normalization-Free SE-ResNet26
-    """
+def nf_seresnet26(pretrained: bool = False, **kwargs: Any) -> NormFreeNet:
+    """Normalization-Free SE-ResNet26."""
     return _create_normfreenet('nf_seresnet26', pretrained=pretrained, **kwargs)
 
 
 @register_model
-def nf_seresnet50(pretrained=False, **kwargs) -> NormFreeNet:
-    """ Normalization-Free SE-ResNet50
-    """
+def nf_seresnet50(pretrained: bool = False, **kwargs: Any) -> NormFreeNet:
+    """Normalization-Free SE-ResNet50."""
     return _create_normfreenet('nf_seresnet50', pretrained=pretrained, **kwargs)
 
 
 @register_model
-def nf_seresnet101(pretrained=False, **kwargs) -> NormFreeNet:
-    """ Normalization-Free SE-ResNet101
-    """
+def nf_seresnet101(pretrained: bool = False, **kwargs: Any) -> NormFreeNet:
+    """Normalization-Free SE-ResNet101."""
     return _create_normfreenet('nf_seresnet101', pretrained=pretrained, **kwargs)
 
 
 @register_model
-def nf_ecaresnet26(pretrained=False, **kwargs) -> NormFreeNet:
-    """ Normalization-Free ECA-ResNet26
-    """
+def nf_ecaresnet26(pretrained: bool = False, **kwargs: Any) -> NormFreeNet:
+    """Normalization-Free ECA-ResNet26."""
     return _create_normfreenet('nf_ecaresnet26', pretrained=pretrained, **kwargs)
 
 
 @register_model
-def nf_ecaresnet50(pretrained=False, **kwargs) -> NormFreeNet:
-    """ Normalization-Free ECA-ResNet50
-    """
+def nf_ecaresnet50(pretrained: bool = False, **kwargs: Any) -> NormFreeNet:
+    """Normalization-Free ECA-ResNet50."""
     return _create_normfreenet('nf_ecaresnet50', pretrained=pretrained, **kwargs)
 
 
 @register_model
-def nf_ecaresnet101(pretrained=False, **kwargs) -> NormFreeNet:
-    """ Normalization-Free ECA-ResNet101
-    """
+def nf_ecaresnet101(pretrained: bool = False, **kwargs: Any) -> NormFreeNet:
+    """Normalization-Free ECA-ResNet101."""
     return _create_normfreenet('nf_ecaresnet101', pretrained=pretrained, **kwargs)
+
+
+@register_model
+def test_nfnet(pretrained: bool = False, **kwargs: Any) -> NormFreeNet:
+    """Test NFNet model for experimentation."""
+    return _create_normfreenet('test_nfnet', pretrained=pretrained, **kwargs)

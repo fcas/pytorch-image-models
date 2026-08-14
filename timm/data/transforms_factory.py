@@ -11,8 +11,9 @@ from torchvision import transforms
 
 from timm.data.constants import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD, DEFAULT_CROP_PCT
 from timm.data.auto_augment import rand_augment_transform, augment_and_mix_transform, auto_augment_transform
-from timm.data.transforms import str_to_interp_mode, str_to_pil_interp, RandomResizedCropAndInterpolation,\
-    ResizeKeepRatio, CenterCropOrPad, RandomCropOrPad, TrimBorder, ToNumpy
+from timm.data.transforms import str_to_interp_mode, str_to_pil_interp, RandomResizedCropAndInterpolation, \
+    ResizeKeepRatio, CenterCropOrPad, RandomCropOrPad, TrimBorder, MaybeToTensor, MaybePILToTensor
+from timm.data.naflex_transforms import RandomResizedCropToSequence, ResizeToSequence, Patchify
 from timm.data.random_erasing import RandomErasing
 
 
@@ -46,13 +47,13 @@ def transforms_noaug_train(
     ]
     if use_prefetcher:
         # prefetcher and collate will handle tensor conversion and norm
-        tfl += [ToNumpy()]
+        tfl += [MaybePILToTensor()]
     elif not normalize:
         # when normalize disabled, converted to tensor without scaling, keep original dtype
-        tfl += [transforms.PILToTensor()]
+        tfl += [MaybePILToTensor()]
     else:
         tfl += [
-            transforms.ToTensor(),
+            MaybeToTensor(),
             transforms.Normalize(
                 mean=torch.tensor(mean),
                 std=torch.tensor(std)
@@ -84,6 +85,11 @@ def transforms_imagenet_train(
         use_prefetcher: bool = False,
         normalize: bool = True,
         separate: bool = False,
+        naflex: bool = False,
+        patch_size: Union[int, Tuple[int, int]] = 16,
+        max_seq_len: int = 576,  # 24x24 for 16x16 patch
+        patchify: bool = False,
+        patchify_channels_last: bool = True,
 ):
     """ ImageNet-oriented image transforms for training.
 
@@ -111,45 +117,62 @@ def transforms_imagenet_train(
         use_prefetcher: Prefetcher enabled. Do not convert image to tensor or normalize.
         normalize: Normalize tensor output w/ provided mean/std (if prefetcher not used).
         separate: Output transforms in 3-stage tuple.
+        naflex: Enable NaFlex mode, sequence constrained patch output
+        patch_size: Patch size for NaFlex mode.
+        max_seq_len: Max sequence length for NaFlex mode.
 
     Returns:
         If separate==True, the transforms are returned as a tuple of 3 separate transforms
-        for use in a mixing dataset that passes
-         * all data through the first (primary) transform, called the 'clean' data
-         * a portion of the data through the secondary transform
-         * normalizes and converts the branches above with the third, final transform
+          for use in a mixing dataset that passes
+            * all data through the first (primary) transform, called the 'clean' data
+            * a portion of the data through the secondary transform
+            * normalizes and converts the branches above with the third, final transform
     """
     train_crop_mode = train_crop_mode or 'rrc'
     assert train_crop_mode in {'rrc', 'rkrc', 'rkrr'}
-    if train_crop_mode in ('rkrc', 'rkrr'):
-        # FIXME integration of RKR is a WIP
-        scale = tuple(scale or (0.8, 1.00))
-        ratio = tuple(ratio or (0.9, 1/.9))
-        primary_tfl = [
-            ResizeKeepRatio(
-                img_size,
-                interpolation=interpolation,
-                random_scale_prob=0.5,
-                random_scale_range=scale,
-                random_scale_area=True,  # scale compatible with RRC
-                random_aspect_prob=0.5,
-                random_aspect_range=ratio,
-            ),
-            CenterCropOrPad(img_size, padding_mode='reflect')
-            if train_crop_mode == 'rkrc' else
-            RandomCropOrPad(img_size, padding_mode='reflect')
-        ]
-    else:
+
+    primary_tfl = []
+    if naflex:
         scale = tuple(scale or (0.08, 1.0))  # default imagenet scale range
         ratio = tuple(ratio or (3. / 4., 4. / 3.))  # default imagenet ratio range
-        primary_tfl = [
-            RandomResizedCropAndInterpolation(
-                img_size,
-                scale=scale,
-                ratio=ratio,
-                interpolation=interpolation,
-            )
-        ]
+        primary_tfl += [RandomResizedCropToSequence(
+            patch_size=patch_size,
+            max_seq_len=max_seq_len,
+            scale=scale,
+            ratio=ratio,
+            interpolation=interpolation
+        )]
+    else:
+        if train_crop_mode in ('rkrc', 'rkrr'):
+            # FIXME integration of RKR is a WIP
+            scale = tuple(scale or (0.8, 1.00))
+            ratio = tuple(ratio or (0.9, 1/.9))
+            primary_tfl += [
+                ResizeKeepRatio(
+                    img_size,
+                    interpolation=interpolation,
+                    random_scale_prob=0.5,
+                    random_scale_range=scale,
+                    random_scale_area=True,  # scale compatible with RRC
+                    random_aspect_prob=0.5,
+                    random_aspect_range=ratio,
+                ),
+                CenterCropOrPad(img_size, padding_mode='reflect')
+                if train_crop_mode == 'rkrc' else
+                RandomCropOrPad(img_size, padding_mode='reflect')
+            ]
+        else:
+            scale = tuple(scale or (0.08, 1.0))  # default imagenet scale range
+            ratio = tuple(ratio or (3. / 4., 4. / 3.))  # default imagenet ratio range
+            primary_tfl += [
+                RandomResizedCropAndInterpolation(
+                    img_size,
+                    scale=scale,
+                    ratio=ratio,
+                    interpolation=interpolation,
+                )
+            ]
+
     if hflip > 0.:
         primary_tfl += [transforms.RandomHorizontalFlip(p=hflip)]
     if vflip > 0.:
@@ -215,13 +238,13 @@ def transforms_imagenet_train(
     final_tfl = []
     if use_prefetcher:
         # prefetcher and collate will handle tensor conversion and norm
-        final_tfl += [ToNumpy()]
+        final_tfl += [MaybePILToTensor()]
     elif not normalize:
         # when normalize disable, converted to tensor without scaling, keeps original dtype
-        final_tfl += [transforms.PILToTensor()]
+        final_tfl += [MaybePILToTensor()]
     else:
         final_tfl += [
-            transforms.ToTensor(),
+            MaybeToTensor(),
             transforms.Normalize(
                 mean=torch.tensor(mean),
                 std=torch.tensor(std),
@@ -237,6 +260,9 @@ def transforms_imagenet_train(
                     device='cpu',
                 )
             ]
+
+    if patchify:
+        final_tfl += [Patchify(patch_size=patch_size, channels_last=patchify_channels_last)]
 
     if separate:
         return transforms.Compose(primary_tfl), transforms.Compose(secondary_tfl), transforms.Compose(final_tfl)
@@ -254,6 +280,12 @@ def transforms_imagenet_eval(
         std: Tuple[float, ...] = IMAGENET_DEFAULT_STD,
         use_prefetcher: bool = False,
         normalize: bool = True,
+        naflex: bool = False,
+        patch_size: Union[int, Tuple[int, int]] = 16,
+        max_seq_len: int = 576,  # 24x24 for 16x16 patch
+        patchify: bool = False,
+        patchify_channels_last: bool = True,
+        patchify_flatten: bool = True,
 ):
     """ ImageNet-oriented image transform for evaluation and inference.
 
@@ -267,6 +299,13 @@ def transforms_imagenet_eval(
         std: Image normalization standard deviation.
         use_prefetcher: Prefetcher enabled. Do not convert image to tensor or normalize.
         normalize: Normalize tensor output w/ provided mean/std (if prefetcher not used).
+        naflex: Enable NaFlex mode, sequence constrained patch output
+        patch_size: Patch size for NaFlex mode.
+        max_seq_len: Max sequence length for NaFlex mode.
+        patchify: Patchify the output instead of relying on prefetcher
+        patchify_channels_last: Use channels-last layout within each patch.
+        patchify_flatten: Flatten each patch into a vector. Disable for variable
+            patch-size interpolation, which requires spatial patch dimensions.
 
     Returns:
         Composed transform pipeline
@@ -285,48 +324,62 @@ def transforms_imagenet_eval(
     if crop_border_pixels:
         tfl += [TrimBorder(crop_border_pixels)]
 
-    if crop_mode == 'squash':
-        # squash mode scales each edge to 1/pct of target, then crops
-        # aspect ratio is not preserved, no img lost if crop_pct == 1.0
-        tfl += [
-            transforms.Resize(scale_size, interpolation=str_to_interp_mode(interpolation)),
-            transforms.CenterCrop(img_size),
-        ]
-    elif crop_mode == 'border':
-        # scale the longest edge of image to 1/pct of target edge, add borders to pad, then crop
-        # no image lost if crop_pct == 1.0
-        fill = [round(255 * v) for v in mean]
-        tfl += [
-            ResizeKeepRatio(scale_size, interpolation=interpolation, longest=1.0),
-            CenterCropOrPad(img_size, fill=fill),
-        ]
+    if naflex:
+        tfl += [ResizeToSequence(
+            patch_size=patch_size,
+            max_seq_len=max_seq_len,
+            interpolation=interpolation,
+        )]
     else:
-        # default crop model is center
-        # aspect ratio is preserved, crops center within image, no borders are added, image is lost
-        if scale_size[0] == scale_size[1]:
-            # simple case, use torchvision built-in Resize w/ shortest edge mode (scalar size arg)
+        if crop_mode == 'squash':
+            # squash mode scales each edge to 1/pct of target, then crops
+            # aspect ratio is not preserved, no img lost if crop_pct == 1.0
             tfl += [
-                transforms.Resize(scale_size[0], interpolation=str_to_interp_mode(interpolation))
+                transforms.Resize(scale_size, interpolation=str_to_interp_mode(interpolation)),
+                transforms.CenterCrop(img_size),
+            ]
+        elif crop_mode == 'border':
+            # scale the longest edge of image to 1/pct of target edge, add borders to pad, then crop
+            # no image lost if crop_pct == 1.0
+            fill = [round(255 * v) for v in mean]
+            tfl += [
+                ResizeKeepRatio(scale_size, interpolation=interpolation, longest=1.0),
+                CenterCropOrPad(img_size, fill=fill),
             ]
         else:
-            # resize the shortest edge to matching target dim for non-square target
-            tfl += [ResizeKeepRatio(scale_size)]
-        tfl += [transforms.CenterCrop(img_size)]
+            # default crop model is center
+            # aspect ratio is preserved, crops center within image, no borders are added, image is lost
+            if scale_size[0] == scale_size[1]:
+                # simple case, use torchvision built-in Resize w/ shortest edge mode (scalar size arg)
+                tfl += [
+                    transforms.Resize(scale_size[0], interpolation=str_to_interp_mode(interpolation))
+                ]
+            else:
+                # resize the shortest edge to matching target dim for non-square target
+                tfl += [ResizeKeepRatio(scale_size)]
+            tfl += [transforms.CenterCrop(img_size)]
 
     if use_prefetcher:
         # prefetcher and collate will handle tensor conversion and norm
-        tfl += [ToNumpy()]
+        tfl += [MaybePILToTensor()]
     elif not normalize:
         # when normalize disabled, converted to tensor without scaling, keeps original dtype
-        tfl += [transforms.PILToTensor()]
+        tfl += [MaybePILToTensor()]
     else:
         tfl += [
-            transforms.ToTensor(),
+            MaybeToTensor(),
             transforms.Normalize(
                 mean=torch.tensor(mean),
                 std=torch.tensor(std),
             ),
         ]
+
+    if patchify:
+        tfl += [Patchify(
+            patch_size=patch_size,
+            flatten_patches=patchify_flatten,
+            channels_last=patchify_channels_last,
+        )]
 
     return transforms.Compose(tfl)
 
@@ -359,6 +412,12 @@ def create_transform(
         use_prefetcher: bool = False,
         normalize: bool = True,
         separate: bool = False,
+        naflex: bool = False,
+        patch_size: Union[int, Tuple[int, int]] = 16,
+        max_seq_len: int = 576,  # 24x24 for 16x16 patch
+        patchify: bool = False,
+        patchify_channels_last: bool = True,
+        patchify_flatten: bool = True,
 ):
     """
 
@@ -391,6 +450,10 @@ def create_transform(
         use_prefetcher: Pre-fetcher enabled. Do not convert image to tensor or normalize.
         normalize: Normalization tensor output w/ provided mean/std (if prefetcher not used).
         separate: Output transforms in 3-stage tuple.
+        patchify: Patchify the output instead of relying on prefetcher.
+        patchify_channels_last: Use channels-last layout within each patch.
+        patchify_flatten: Flatten eval patches into vectors. Disable when the
+            model needs their spatial dimensions for patch-size interpolation.
 
     Returns:
         Composed transforms or tuple thereof
@@ -442,6 +505,11 @@ def create_transform(
                 use_prefetcher=use_prefetcher,
                 normalize=normalize,
                 separate=separate,
+                naflex=naflex,
+                patch_size=patch_size,
+                max_seq_len=max_seq_len,
+                patchify=patchify,
+                patchify_channels_last=patchify_channels_last,
             )
         else:
             assert not separate, "Separate transforms not supported for validation preprocessing"
@@ -455,6 +523,12 @@ def create_transform(
                 crop_border_pixels=crop_border_pixels,
                 use_prefetcher=use_prefetcher,
                 normalize=normalize,
+                naflex=naflex,
+                patch_size=patch_size,
+                max_seq_len=max_seq_len,
+                patchify=patchify,
+                patchify_channels_last=patchify_channels_last,
+                patchify_flatten=patchify_flatten,
             )
 
     return transform

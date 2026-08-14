@@ -5,7 +5,7 @@ timm functionality.
 
 Copyright 2021 Ross Wightman
 """
-from typing import Union, List, Dict, Any, cast
+from typing import Any, Dict, List, Optional, Type, Union, cast
 
 import torch
 import torch.nn as nn
@@ -30,27 +30,53 @@ cfgs: Dict[str, List[Union[str, int]]] = {
 
 @register_notrace_module  # reason: FX can't symbolically trace control flow in forward method
 class ConvMlp(nn.Module):
+    """Convolutional MLP block for VGG head.
+
+    Replaces traditional Linear layers with Conv2d layers in the classifier.
+    """
 
     def __init__(
             self,
-            in_features=512,
-            out_features=4096,
-            kernel_size=7,
-            mlp_ratio=1.0,
+            in_features: int = 512,
+            out_features: int = 4096,
+            kernel_size: int = 7,
+            mlp_ratio: float = 1.0,
             drop_rate: float = 0.2,
-            act_layer: nn.Module = None,
-            conv_layer: nn.Module = None,
-    ):
-        super(ConvMlp, self).__init__()
+            act_layer: Type[nn.Module] = nn.ReLU,
+            conv_layer: Type[nn.Module] = nn.Conv2d,
+            device=None,
+            dtype=None,
+    ) -> None:
+        """Initialize ConvMlp.
+
+        Args:
+            in_features: Number of input features.
+            out_features: Number of output features.
+            kernel_size: Kernel size for first conv layer.
+            mlp_ratio: Ratio for hidden layer size.
+            drop_rate: Dropout rate.
+            act_layer: Activation layer type.
+            conv_layer: Convolution layer type.
+        """
+        dd = {'device': device, 'dtype': dtype}
+        super().__init__()
         self.input_kernel_size = kernel_size
         mid_features = int(out_features * mlp_ratio)
-        self.fc1 = conv_layer(in_features, mid_features, kernel_size, bias=True)
+        self.fc1 = conv_layer(in_features, mid_features, kernel_size, bias=True, **dd)
         self.act1 = act_layer(True)
         self.drop = nn.Dropout(drop_rate)
-        self.fc2 = conv_layer(mid_features, out_features, 1, bias=True)
+        self.fc2 = conv_layer(mid_features, out_features, 1, bias=True, **dd)
         self.act2 = act_layer(True)
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass.
+
+        Args:
+            x: Input tensor.
+
+        Returns:
+            Output tensor.
+        """
         if x.shape[-2] < self.input_kernel_size or x.shape[-1] < self.input_kernel_size:
             # keep the input size >= 7x7
             output_size = (max(self.input_kernel_size, x.shape[-2]), max(self.input_kernel_size, x.shape[-1]))
@@ -64,6 +90,11 @@ class ConvMlp(nn.Module):
 
 
 class VGG(nn.Module):
+    """VGG model architecture.
+
+    Based on `Very Deep Convolutional Networks for Large-Scale Image Recognition`
+    - https://arxiv.org/abs/1409.1556
+    """
 
     def __init__(
             self,
@@ -72,20 +103,38 @@ class VGG(nn.Module):
             in_chans: int = 3,
             output_stride: int = 32,
             mlp_ratio: float = 1.0,
-            act_layer: nn.Module = nn.ReLU,
-            conv_layer: nn.Module = nn.Conv2d,
-            norm_layer: nn.Module = None,
+            act_layer: Type[nn.Module] = nn.ReLU,
+            conv_layer: Type[nn.Module] = nn.Conv2d,
+            norm_layer: Optional[Type[nn.Module]] = None,
             global_pool: str = 'avg',
             drop_rate: float = 0.,
+            device=None,
+            dtype=None,
     ) -> None:
-        super(VGG, self).__init__()
+        """Initialize VGG model.
+
+        Args:
+            cfg: Configuration list defining network architecture.
+            num_classes: Number of classes for classification.
+            in_chans: Number of input channels.
+            output_stride: Output stride of network.
+            mlp_ratio: Ratio for MLP hidden layer size.
+            act_layer: Activation layer type.
+            conv_layer: Convolution layer type.
+            norm_layer: Normalization layer type.
+            global_pool: Global pooling type.
+            drop_rate: Dropout rate.
+        """
+        super().__init__()
+        dd = {'device': device, 'dtype': dtype}
         assert output_stride == 32
         self.num_classes = num_classes
-        self.num_features = 4096
+        self.in_chans = in_chans
         self.drop_rate = drop_rate
         self.grad_checkpointing = False
         self.use_norm = norm_layer is not None
         self.feature_info = []
+
         prev_chs = in_chans
         net_stride = 1
         pool_layer = nn.MaxPool2d
@@ -98,69 +147,118 @@ class VGG(nn.Module):
                 net_stride *= 2
             else:
                 v = cast(int, v)
-                conv2d = conv_layer(prev_chs, v, kernel_size=3, padding=1)
+                conv2d = conv_layer(prev_chs, v, kernel_size=3, padding=1, **dd)
                 if norm_layer is not None:
-                    layers += [conv2d, norm_layer(v), act_layer(inplace=True)]
+                    layers += [conv2d, norm_layer(v, **dd), act_layer(inplace=True)]
                 else:
                     layers += [conv2d, act_layer(inplace=True)]
                 prev_chs = v
         self.features = nn.Sequential(*layers)
         self.feature_info.append(dict(num_chs=prev_chs, reduction=net_stride, module=f'features.{len(layers) - 1}'))
 
+        self.num_features = prev_chs
+        self.head_hidden_size = 4096
         self.pre_logits = ConvMlp(
             prev_chs,
-            self.num_features,
+            self.head_hidden_size,
             7,
             mlp_ratio=mlp_ratio,
             drop_rate=drop_rate,
             act_layer=act_layer,
             conv_layer=conv_layer,
+            **dd,
         )
         self.head = ClassifierHead(
-            self.num_features,
+            self.head_hidden_size,
             num_classes,
             pool_type=global_pool,
             drop_rate=drop_rate,
+            **dd,
         )
 
         self._initialize_weights()
 
     @torch.jit.ignore
-    def group_matcher(self, coarse=False):
+    def group_matcher(self, coarse: bool = False) -> Dict[str, Any]:
+        """Group matcher for parameter groups.
+
+        Args:
+            coarse: Whether to use coarse grouping.
+
+        Returns:
+            Dictionary of grouped parameters.
+        """
         # this treats BN layers as separate groups for bn variants, a lot of effort to fix that
         return dict(stem=r'^features\.0', blocks=r'^features\.(\d+)')
 
     @torch.jit.ignore
-    def set_grad_checkpointing(self, enable=True):
+    def set_grad_checkpointing(self, enable: bool = True) -> None:
+        """Enable or disable gradient checkpointing.
+
+        Args:
+            enable: Whether to enable gradient checkpointing.
+        """
         assert not enable, 'gradient checkpointing not supported'
 
     @torch.jit.ignore
-    def get_classifier(self):
+    def get_classifier(self) -> nn.Module:
+        """Get the classifier module.
+
+        Returns:
+            Classifier module.
+        """
         return self.head.fc
 
-    def reset_classifier(self, num_classes, global_pool='avg'):
+    def reset_classifier(self, num_classes: int, global_pool: Optional[str] = None) -> None:
+        """Reset the classifier.
+
+        Args:
+            num_classes: Number of classes for new classifier.
+            global_pool: Global pooling type.
+        """
         self.num_classes = num_classes
-        self.head = ClassifierHead(
-            self.num_features,
-            self.num_classes,
-            pool_type=global_pool,
-            drop_rate=self.drop_rate,
-        )
+        self.head.reset(num_classes, global_pool)
 
     def forward_features(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass through feature extraction layers.
+
+        Args:
+            x: Input tensor.
+
+        Returns:
+            Feature tensor.
+        """
         x = self.features(x)
         return x
 
-    def forward_head(self, x: torch.Tensor, pre_logits: bool = False):
+    def forward_head(self, x: torch.Tensor, pre_logits: bool = False) -> torch.Tensor:
+        """Forward pass through head.
+
+        Args:
+            x: Input features.
+            pre_logits: Return features before final linear layer.
+
+        Returns:
+            Classification logits or features.
+        """
         x = self.pre_logits(x)
-        return x if pre_logits else self.head(x)
+        return self.head(x, pre_logits=pre_logits) if pre_logits else self.head(x)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass.
+
+        Args:
+            x: Input tensor.
+
+        Returns:
+            Output logits.
+        """
         x = self.forward_features(x)
         x = self.forward_head(x)
         return x
 
     def _initialize_weights(self) -> None:
+        """Initialize model weights."""
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
                 nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
@@ -174,8 +272,15 @@ class VGG(nn.Module):
                 nn.init.constant_(m.bias, 0)
 
 
-def _filter_fn(state_dict):
-    """ convert patch embedding weight from manual patchify + linear proj to conv"""
+def _filter_fn(state_dict: dict) -> Dict[str, torch.Tensor]:
+    """Convert patch embedding weight from manual patchify + linear proj to conv.
+
+    Args:
+        state_dict: State dictionary to filter.
+
+    Returns:
+        Filtered state dictionary.
+    """
     out_dict = {}
     for k, v in state_dict.items():
         k_r = k
@@ -191,6 +296,16 @@ def _filter_fn(state_dict):
 
 
 def _create_vgg(variant: str, pretrained: bool, **kwargs: Any) -> VGG:
+    """Create a VGG model.
+
+    Args:
+        variant: Model variant name.
+        pretrained: Load pretrained weights.
+        **kwargs: Additional model arguments.
+
+    Returns:
+        VGG model instance.
+    """
     cfg = variant.split('_')[0]
     # NOTE: VGG is one of few models with stride==1 features w/ 6 out_indices [0..5]
     out_indices = kwargs.pop('out_indices', (0, 1, 2, 3, 4, 5))
@@ -206,13 +321,23 @@ def _create_vgg(variant: str, pretrained: bool, **kwargs: Any) -> VGG:
     return model
 
 
-def _cfg(url='', **kwargs):
+def _cfg(url: str = '', **kwargs) -> Dict[str, Any]:
+    """Create default configuration dictionary.
+
+    Args:
+        url: Model weight URL.
+        **kwargs: Additional configuration options.
+
+    Returns:
+        Configuration dictionary.
+    """
     return {
         'url': url,
         'num_classes': 1000, 'input_size': (3, 224, 224), 'pool_size': (7, 7),
         'crop_pct': 0.875, 'interpolation': 'bilinear',
         'mean': IMAGENET_DEFAULT_MEAN, 'std': IMAGENET_DEFAULT_STD,
         'first_conv': 'features.0', 'classifier': 'head.fc',
+        'license': 'bsd-3-clause',
         **kwargs
     }
 

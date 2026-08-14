@@ -31,14 +31,31 @@ Hacked together by / copyright Ross Wightman, 2021.
 import math
 from dataclasses import dataclass, field, replace
 from functools import partial
-from typing import Tuple, List, Dict, Optional, Union, Any, Callable, Sequence
+from typing import Tuple, List, Dict, Optional, Union, Any, Callable, Sequence, Type
 
 import torch
 import torch.nn as nn
 
-from timm.data import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
-from timm.layers import ClassifierHead, ConvNormAct, BatchNormAct2d, DropPath, AvgPool2dSame, \
-    create_conv2d, get_act_layer, get_norm_act_layer, get_attn, make_divisible, to_2tuple, EvoNorm2dS0a
+from timm.data import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD, OPENAI_CLIP_MEAN, OPENAI_CLIP_STD
+from timm.layers import (
+    ClassifierHead,
+    NormMlpClassifierHead,
+    ConvNormAct,
+    BatchNormAct2d,
+    DropBlock2d,
+    EvoNorm2dS0a,
+    AttentionPool2d,
+    RotAttentionPool2d,
+    DropPath,
+    calculate_drop_path_rates,
+    AvgPool2dSame,
+    create_conv2d,
+    get_act_layer,
+    get_norm_act_layer,
+    get_attn,
+    make_divisible,
+    to_2tuple,
+)
 from ._builder import build_model_with_cfg
 from ._features import feature_take_indices
 from ._manipulate import named_apply, checkpoint_seq
@@ -49,6 +66,10 @@ __all__ = ['ByobNet', 'ByoModelCfg', 'ByoBlockCfg', 'create_byob_stem', 'create_
 
 @dataclass
 class ByoBlockCfg:
+    """Block configuration for Bring-Your-Own-Blocks.
+
+    Defines configuration for a single block or stage of blocks.
+    """
     type: Union[str, nn.Module]
     d: int  # block depth (number of block repeats in stage)
     c: int  # number of output channels for each block in stage
@@ -66,19 +87,30 @@ class ByoBlockCfg:
 
 @dataclass
 class ByoModelCfg:
+    """Model configuration for Bring-Your-Own-Blocks network.
+
+    Defines overall architecture configuration.
+    """
     blocks: Tuple[Union[ByoBlockCfg, Tuple[ByoBlockCfg, ...]], ...]
     downsample: str = 'conv1x1'
     stem_type: str = '3x3'
     stem_pool: Optional[str] = 'maxpool'
-    stem_chs: int = 32
+    stem_chs: Union[int, List[int], Tuple[int, ...]] = 32
     width_factor: float = 1.0
     num_features: int = 0  # num out_channels for final conv, no final 1x1 conv if 0
     zero_init_last: bool = True  # zero init last weight (usually bn) in residual path
     fixed_input_size: bool = False  # model constrained to a fixed-input size / img_size must be provided on creation
 
+    # layer config
     act_layer: str = 'relu'
     norm_layer: str = 'batchnorm'
+    aa_layer: str = ''
 
+    # Head config
+    head_hidden_size: Optional[int] = None  # feat dim of MLP head or AttentionPool output
+    head_type: str = 'classifier'
+
+    # Block config
     # NOTE: these config items will be overridden by the block cfg (per-block) if they are set there
     attn_layer: Optional[str] = None
     attn_kwargs: dict = field(default_factory=lambda: dict())
@@ -87,7 +119,18 @@ class ByoModelCfg:
     block_kwargs: Dict[str, Any] = field(default_factory=lambda: dict())
 
 
-def _rep_vgg_bcfg(d=(4, 6, 16, 1), wf=(1., 1., 1., 1.), groups=0):
+def _rep_vgg_bcfg(d: Tuple[int, ...] = (4, 6, 16, 1), wf: Tuple[float, ...] = (1., 1., 1., 1.), groups: int = 0) -> \
+Tuple[ByoBlockCfg, ...]:
+    """Create RepVGG block configuration.
+
+    Args:
+        d: Depth (number of blocks) per stage.
+        wf: Width factor per stage.
+        groups: Number of groups for grouped convolution.
+
+    Returns:
+        Tuple of block configurations.
+    """
     c = (64, 128, 256, 512)
     group_size = 0
     if groups > 0:
@@ -96,7 +139,23 @@ def _rep_vgg_bcfg(d=(4, 6, 16, 1), wf=(1., 1., 1., 1.), groups=0):
     return bcfg
 
 
-def _mobileone_bcfg(d=(2, 8, 10, 1), wf=(1., 1., 1., 1.), se_blocks=(), num_conv_branches=1):
+def _mobileone_bcfg(
+        d: Tuple[int, ...] = (2, 8, 10, 1),
+        wf: Tuple[float, ...] = (1., 1., 1., 1.),
+        se_blocks: Tuple[int, ...] = (),
+        num_conv_branches: int = 1
+) -> List[List[ByoBlockCfg]]:
+    """Create MobileOne block configuration.
+
+    Args:
+        d: Depth (number of blocks) per stage.
+        wf: Width factor per stage.
+        se_blocks: Number of SE blocks per stage.
+        num_conv_branches: Number of conv branches.
+
+    Returns:
+        List of block configurations per stage.
+    """
     c = (64, 128, 256, 512)
     prev_c = min(64, c[0] * wf[0])
     se_blocks = se_blocks or (0,) * len(d)
@@ -118,12 +177,23 @@ def _mobileone_bcfg(d=(2, 8, 10, 1), wf=(1., 1., 1., 1.), se_blocks=(), num_conv
 
 
 def interleave_blocks(
-        types: Tuple[str, str], d,
+        types: Tuple[str, str],
+        d: int,
         every: Union[int, List[int]] = 1,
         first: bool = False,
         **kwargs,
-) -> Tuple[ByoBlockCfg]:
-    """ interleave 2 block types in stack
+) -> Tuple[ByoBlockCfg, ...]:
+    """Interleave 2 block types in stack.
+
+    Args:
+        types: Two block type names to interleave.
+        d: Total depth of blocks.
+        every: Interval for alternating blocks.
+        first: Whether to start with alternate block.
+        **kwargs: Additional block arguments.
+
+    Returns:
+        Tuple of interleaved block configurations.
     """
     assert len(types) == 2
     if isinstance(every, int):
@@ -139,6 +209,14 @@ def interleave_blocks(
 
 
 def expand_blocks_cfg(stage_blocks_cfg: Union[ByoBlockCfg, Sequence[ByoBlockCfg]]) -> List[ByoBlockCfg]:
+    """Expand block config into individual block instances.
+
+    Args:
+        stage_blocks_cfg: Block configuration(s) for a stage.
+
+    Returns:
+        List of individual block configurations.
+    """
     if not isinstance(stage_blocks_cfg, Sequence):
         stage_blocks_cfg = (stage_blocks_cfg,)
     block_cfgs = []
@@ -147,7 +225,16 @@ def expand_blocks_cfg(stage_blocks_cfg: Union[ByoBlockCfg, Sequence[ByoBlockCfg]
     return block_cfgs
 
 
-def num_groups(group_size, channels):
+def num_groups(group_size: Optional[int], channels: int) -> int:
+    """Calculate number of groups for grouped convolution.
+
+    Args:
+        group_size: Size of each group (1 for depthwise).
+        channels: Number of channels.
+
+    Returns:
+        Number of groups.
+    """
     if not group_size:  # 0 or None
         return 1  # normal conv with 1 group
     else:
@@ -158,14 +245,20 @@ def num_groups(group_size, channels):
 
 @dataclass
 class LayerFn:
-    conv_norm_act: Callable = ConvNormAct
-    norm_act: Callable = BatchNormAct2d
-    act: Callable = nn.ReLU
-    attn: Optional[Callable] = None
-    self_attn: Optional[Callable] = None
+    """Container for layer factory functions."""
+    conv_norm_act: Type[nn.Module] = ConvNormAct
+    norm_act: Type[nn.Module] = BatchNormAct2d
+    act: Type[nn.Module] = nn.ReLU
+    attn: Optional[Type[nn.Module]] = None
+    self_attn: Optional[Type[nn.Module]] = None
 
 
 class DownsampleAvg(nn.Module):
+    """Average pool downsampling module.
+
+    AvgPool Downsampling as in 'D' ResNet variants.
+    """
+
     def __init__(
             self,
             in_chs: int,
@@ -173,10 +266,22 @@ class DownsampleAvg(nn.Module):
             stride: int = 1,
             dilation: int = 1,
             apply_act: bool = False,
-            layers: LayerFn = None,
+            layers: Optional[LayerFn] = None,
+            device=None,
+            dtype=None,
     ):
-        """ AvgPool Downsampling as in 'D' ResNet variants."""
-        super(DownsampleAvg, self).__init__()
+        """Initialize DownsampleAvg.
+
+        Args:
+            in_chs: Number of input channels.
+            out_chs: Number of output channels.
+            stride: Stride for downsampling.
+            dilation: Dilation rate.
+            apply_act: Whether to apply activation.
+            layers: Layer factory functions.
+        """
+        dd = {'device': device, 'dtype': dtype}
+        super().__init__()
         layers = layers or LayerFn()
         avg_stride = stride if dilation == 1 else 1
         if stride > 1 or dilation > 1:
@@ -184,9 +289,17 @@ class DownsampleAvg(nn.Module):
             self.pool = avg_pool_fn(2, avg_stride, ceil_mode=True, count_include_pad=False)
         else:
             self.pool = nn.Identity()
-        self.conv = layers.conv_norm_act(in_chs, out_chs, 1, apply_act=apply_act)
+        self.conv = layers.conv_norm_act(in_chs, out_chs, 1, apply_act=apply_act, **dd)
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass.
+
+        Args:
+            x: Input tensor.
+
+        Returns:
+            Output tensor.
+        """
         return self.conv(self.pool(x))
 
 
@@ -198,7 +311,21 @@ def create_shortcut(
         dilation: Tuple[int, int],
         layers: LayerFn,
         **kwargs,
-):
+) -> Optional[nn.Module]:
+    """Create shortcut connection for residual blocks.
+
+    Args:
+        downsample_type: Type of downsampling ('avg', 'conv1x1', or '').
+        in_chs: Input channels.
+        out_chs: Output channels.
+        stride: Stride for downsampling.
+        dilation: Dilation rates.
+        layers: Layer factory functions.
+        **kwargs: Additional arguments.
+
+    Returns:
+        Shortcut module or None.
+    """
     assert downsample_type in ('avg', 'conv1x1', '')
     if in_chs != out_chs or stride != 1 or dilation[0] != dilation[1]:
         if not downsample_type:
@@ -230,24 +357,39 @@ class BasicBlock(nn.Module):
             layers: LayerFn = None,
             drop_block: Callable = None,
             drop_path_rate: float = 0.,
+            device=None,
+            dtype=None,
     ):
-        super(BasicBlock, self).__init__()
+        dd = {'device': device, 'dtype': dtype}
+        super().__init__()
         layers = layers or LayerFn()
         mid_chs = make_divisible(out_chs * bottle_ratio)
         groups = num_groups(group_size, mid_chs)
 
         self.shortcut = create_shortcut(
-            downsample, in_chs, out_chs,
-            stride=stride, dilation=dilation, apply_act=False, layers=layers,
+            downsample,
+            in_chs,
+            out_chs,
+            stride=stride,
+            dilation=dilation,
+            apply_act=False,
+            layers=layers,
+            **dd,
         )
 
-        self.conv1_kxk = layers.conv_norm_act(in_chs, mid_chs, kernel_size, stride=stride, dilation=dilation[0])
+        self.conv1_kxk = layers.conv_norm_act(in_chs, mid_chs, kernel_size, stride=stride, dilation=dilation[0], **dd)
         self.attn = nn.Identity() if attn_last or layers.attn is None else layers.attn(mid_chs)
         self.conv2_kxk = layers.conv_norm_act(
-            mid_chs, out_chs, kernel_size,
-            dilation=dilation[1], groups=groups, drop_layer=drop_block, apply_act=False,
+            mid_chs,
+            out_chs,
+            kernel_size,
+            dilation=dilation[1],
+            groups=groups,
+            drop_layer=drop_block,
+            apply_act=False,
+            **dd,
         )
-        self.attn_last = nn.Identity() if not attn_last or layers.attn is None else layers.attn(out_chs)
+        self.attn_last = nn.Identity() if not attn_last or layers.attn is None else layers.attn(out_chs, **dd)
         self.drop_path = DropPath(drop_path_rate) if drop_path_rate > 0. else nn.Identity()
         self.act = nn.Identity() if linear_out else layers.act(inplace=True)
 
@@ -261,8 +403,9 @@ class BasicBlock(nn.Module):
     def forward(self, x):
         shortcut = x
         x = self.conv1_kxk(x)
-        x = self.conv2_kxk(x)
         x = self.attn(x)
+        x = self.conv2_kxk(x)
+        x = self.attn_last(x)
         x = self.drop_path(x)
         if self.shortcut is not None:
             x = x + self.shortcut(shortcut)
@@ -290,30 +433,51 @@ class BottleneckBlock(nn.Module):
             layers: LayerFn = None,
             drop_block: Callable = None,
             drop_path_rate: float = 0.,
+            device=None,
+            dtype=None,
     ):
-        super(BottleneckBlock, self).__init__()
+        dd = {'device': device, 'dtype': dtype}
+        super().__init__()
         layers = layers or LayerFn()
         mid_chs = make_divisible((in_chs if bottle_in else out_chs) * bottle_ratio)
         groups = num_groups(group_size, mid_chs)
 
         self.shortcut = create_shortcut(
-            downsample, in_chs, out_chs,
-            stride=stride, dilation=dilation, apply_act=False, layers=layers,
+            downsample,
+            in_chs,
+            out_chs,
+            stride=stride,
+            dilation=dilation,
+            apply_act=False,
+            layers=layers,
+            **dd,
         )
 
-        self.conv1_1x1 = layers.conv_norm_act(in_chs, mid_chs, 1)
+        self.conv1_1x1 = layers.conv_norm_act(in_chs, mid_chs, 1, **dd)
         self.conv2_kxk = layers.conv_norm_act(
-            mid_chs, mid_chs, kernel_size,
-            stride=stride, dilation=dilation[0], groups=groups, drop_layer=drop_block,
+            mid_chs,
+            mid_chs,
+            kernel_size,
+            stride=stride,
+            dilation=dilation[0],
+            groups=groups,
+            drop_layer=drop_block,
+            **dd,
         )
         if extra_conv:
             self.conv2b_kxk = layers.conv_norm_act(
-                mid_chs, mid_chs, kernel_size, dilation=dilation[1], groups=groups)
+                mid_chs,
+                mid_chs,
+                kernel_size,
+                dilation=dilation[1],
+                groups=groups,
+                **dd,
+            )
         else:
             self.conv2b_kxk = nn.Identity()
-        self.attn = nn.Identity() if attn_last or layers.attn is None else layers.attn(mid_chs)
-        self.conv3_1x1 = layers.conv_norm_act(mid_chs, out_chs, 1, apply_act=False)
-        self.attn_last = nn.Identity() if not attn_last or layers.attn is None else layers.attn(out_chs)
+        self.attn = nn.Identity() if attn_last or layers.attn is None else layers.attn(mid_chs, **dd)
+        self.conv3_1x1 = layers.conv_norm_act(mid_chs, out_chs, 1, apply_act=False, **dd)
+        self.attn_last = nn.Identity() if not attn_last or layers.attn is None else layers.attn(out_chs, **dd)
         self.drop_path = DropPath(drop_path_rate) if drop_path_rate > 0. else nn.Identity()
         self.act = nn.Identity() if linear_out else layers.act(inplace=True)
 
@@ -364,24 +528,40 @@ class DarkBlock(nn.Module):
             layers: LayerFn = None,
             drop_block: Callable = None,
             drop_path_rate: float = 0.,
+            device=None,
+            dtype=None,
     ):
-        super(DarkBlock, self).__init__()
+        dd = {'device': device, 'dtype': dtype}
+        super().__init__()
         layers = layers or LayerFn()
         mid_chs = make_divisible(out_chs * bottle_ratio)
         groups = num_groups(group_size, mid_chs)
 
         self.shortcut = create_shortcut(
-            downsample, in_chs, out_chs,
-            stride=stride, dilation=dilation, apply_act=False, layers=layers,
+            downsample,
+            in_chs,
+            out_chs,
+            stride=stride,
+            dilation=dilation,
+            apply_act=False,
+            layers=layers,
+            **dd,
         )
 
-        self.conv1_1x1 = layers.conv_norm_act(in_chs, mid_chs, 1)
-        self.attn = nn.Identity() if attn_last or layers.attn is None else layers.attn(mid_chs)
+        self.conv1_1x1 = layers.conv_norm_act(in_chs, mid_chs, 1, **dd)
+        self.attn = nn.Identity() if attn_last or layers.attn is None else layers.attn(mid_chs, **dd)
         self.conv2_kxk = layers.conv_norm_act(
-            mid_chs, out_chs, kernel_size,
-            stride=stride, dilation=dilation[0], groups=groups, drop_layer=drop_block, apply_act=False,
+            mid_chs,
+            out_chs,
+            kernel_size,
+            stride=stride,
+            dilation=dilation[0],
+            groups=groups,
+            drop_layer=drop_block,
+            apply_act=False,
+            **dd,
         )
-        self.attn_last = nn.Identity() if not attn_last or layers.attn is None else layers.attn(out_chs)
+        self.attn_last = nn.Identity() if not attn_last or layers.attn is None else layers.attn(out_chs, **dd)
         self.drop_path = DropPath(drop_path_rate) if drop_path_rate > 0. else nn.Identity()
         self.act = nn.Identity() if linear_out else layers.act(inplace=True)
 
@@ -429,24 +609,38 @@ class EdgeBlock(nn.Module):
             layers: LayerFn = None,
             drop_block: Callable = None,
             drop_path_rate: float = 0.,
+            device=None,
+            dtype=None,
     ):
-        super(EdgeBlock, self).__init__()
+        dd = {'device': device, 'dtype': dtype}
+        super().__init__()
         layers = layers or LayerFn()
         mid_chs = make_divisible(out_chs * bottle_ratio)
         groups = num_groups(group_size, mid_chs)
 
         self.shortcut = create_shortcut(
-            downsample, in_chs, out_chs,
-            stride=stride, dilation=dilation, apply_act=False, layers=layers,
+            downsample,
+            in_chs,
+            out_chs,
+            stride=stride,
+            dilation=dilation,
+            apply_act=False,
+            layers=layers,
+            **dd,
         )
-
         self.conv1_kxk = layers.conv_norm_act(
-            in_chs, mid_chs, kernel_size,
-            stride=stride, dilation=dilation[0], groups=groups, drop_layer=drop_block,
+            in_chs,
+            mid_chs,
+            kernel_size,
+            stride=stride,
+            dilation=dilation[0],
+            groups=groups,
+            drop_layer=drop_block,
+            **dd,
         )
-        self.attn = nn.Identity() if attn_last or layers.attn is None else layers.attn(mid_chs)
-        self.conv2_1x1 = layers.conv_norm_act(mid_chs, out_chs, 1, apply_act=False)
-        self.attn_last = nn.Identity() if not attn_last or layers.attn is None else layers.attn(out_chs)
+        self.attn = nn.Identity() if attn_last or layers.attn is None else layers.attn(mid_chs, **dd)
+        self.conv2_1x1 = layers.conv_norm_act(mid_chs, out_chs, 1, apply_act=False, **dd)
+        self.attn_last = nn.Identity() if not attn_last or layers.attn is None else layers.attn(out_chs, **dd)
         self.drop_path = DropPath(drop_path_rate) if drop_path_rate > 0. else nn.Identity()
         self.act = nn.Identity() if linear_out else layers.act(inplace=True)
 
@@ -488,9 +682,12 @@ class RepVggBlock(nn.Module):
             layers: LayerFn = None,
             drop_block: Callable = None,
             drop_path_rate: float = 0.,
-            inference_mode: bool = False
+            inference_mode: bool = False,
+            device=None,
+            dtype=None,
     ):
-        super(RepVggBlock, self).__init__()
+        dd = {'device': device, 'dtype': dtype}
+        super().__init__()
         self.groups = groups = num_groups(group_size, in_chs)
         layers = layers or LayerFn()
 
@@ -503,19 +700,35 @@ class RepVggBlock(nn.Module):
                 dilation=dilation,
                 groups=groups,
                 bias=True,
+                **dd,
             )
         else:
             self.reparam_conv = None
             use_ident = in_chs == out_chs and stride == 1 and dilation[0] == dilation[1]
-            self.identity = layers.norm_act(out_chs, apply_act=False) if use_ident else None
+            self.identity = layers.norm_act(out_chs, apply_act=False, **dd) if use_ident else None
             self.conv_kxk = layers.conv_norm_act(
-                in_chs, out_chs, kernel_size,
-                stride=stride, dilation=dilation[0], groups=groups, drop_layer=drop_block, apply_act=False,
+                in_chs,
+                out_chs,
+                kernel_size,
+                stride=stride,
+                dilation=dilation[0],
+                groups=groups,
+                drop_layer=drop_block,
+                apply_act=False,
+                **dd,
             )
-            self.conv_1x1 = layers.conv_norm_act(in_chs, out_chs, 1, stride=stride, groups=groups, apply_act=False)
+            self.conv_1x1 = layers.conv_norm_act(
+                in_chs,
+                out_chs,
+                1,
+                stride=stride,
+                groups=groups,
+                apply_act=False,
+                **dd,
+            )
             self.drop_path = DropPath(drop_path_rate) if drop_path_rate > 0. and use_ident else nn.Identity()
 
-        self.attn = nn.Identity() if layers.attn is None else layers.attn(out_chs)
+        self.attn = nn.Identity() if layers.attn is None else layers.attn(out_chs, **dd)
         self.act = layers.act(inplace=True)
 
     def init_weights(self, zero_init_last: bool = False):
@@ -601,7 +814,7 @@ class RepVggBlock(nn.Module):
         return kernel_final, bias_final
 
     def _fuse_bn_tensor(self, branch) -> Tuple[torch.Tensor, torch.Tensor]:
-        """ Method to fuse batchnorm layer with preceeding conv layer.
+        """ Method to fuse batchnorm layer with preceding conv layer.
         Reference: https://github.com/DingXiaoH/RepVGG/blob/main/repvgg.py#L95
         """
         if isinstance(branch, ConvNormAct):
@@ -657,10 +870,13 @@ class MobileOneBlock(nn.Module):
             layers: LayerFn = None,
             drop_block: Callable = None,
             drop_path_rate: float = 0.,
+            device=None,
+            dtype=None,
     ) -> None:
         """ Construct a MobileOneBlock module.
         """
-        super(MobileOneBlock, self).__init__()
+        dd = {'device': device, 'dtype': dtype}
+        super().__init__()
         self.num_conv_branches = num_conv_branches
         self.groups = groups = num_groups(group_size, in_chs)
         layers = layers or LayerFn()
@@ -673,31 +889,45 @@ class MobileOneBlock(nn.Module):
                 stride=stride,
                 dilation=dilation,
                 groups=groups,
-                bias=True)
+                bias=True,
+                **dd,
+            )
         else:
             self.reparam_conv = None
 
             # Re-parameterizable skip connection
             use_ident = in_chs == out_chs and stride == 1 and dilation[0] == dilation[1]
-            self.identity = layers.norm_act(out_chs, apply_act=False) if use_ident else None
+            self.identity = layers.norm_act(out_chs, apply_act=False, **dd) if use_ident else None
 
             # Re-parameterizable conv branches
             convs = []
             for _ in range(self.num_conv_branches):
                 convs.append(layers.conv_norm_act(
-                    in_chs, out_chs, kernel_size=kernel_size,
-                    stride=stride, groups=groups, apply_act=False))
+                    in_chs,
+                    out_chs,
+                    kernel_size=kernel_size,
+                    stride=stride,
+                    groups=groups,
+                    apply_act=False,
+                    **dd,
+                ))
             self.conv_kxk = nn.ModuleList(convs)
 
             # Re-parameterizable scale branch
             self.conv_scale = None
             if kernel_size > 1:
                 self.conv_scale = layers.conv_norm_act(
-                    in_chs, out_chs, kernel_size=1,
-                    stride=stride, groups=groups, apply_act=False)
+                    in_chs,
+                    out_chs,
+                    kernel_size=1,
+                    stride=stride,
+                    groups=groups,
+                    apply_act=False,
+                    **dd,
+                )
             self.drop_path = DropPath(drop_path_rate) if drop_path_rate > 0. and use_ident else nn.Identity()
 
-        self.attn = nn.Identity() if layers.attn is None else layers.attn(out_chs)
+        self.attn = nn.Identity() if layers.attn is None else layers.attn(out_chs, **dd)
         self.act = layers.act(inplace=True)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -790,7 +1020,7 @@ class MobileOneBlock(nn.Module):
         return kernel_final, bias_final
 
     def _fuse_bn_tensor(self, branch) -> Tuple[torch.Tensor, torch.Tensor]:
-        """ Method to fuse batchnorm layer with preceeding conv layer.
+        """ Method to fuse batchnorm layer with preceding conv layer.
         Reference: https://github.com/DingXiaoH/RepVGG/blob/main/repvgg.py#L95
         """
         if isinstance(branch, ConvNormAct):
@@ -843,31 +1073,46 @@ class SelfAttnBlock(nn.Module):
             layers: LayerFn = None,
             drop_block: Callable = None,
             drop_path_rate: float = 0.,
+            device=None,
+            dtype=None,
     ):
-        super(SelfAttnBlock, self).__init__()
+        dd = {'device': device, 'dtype': dtype}
+        super().__init__()
         assert layers is not None
         mid_chs = make_divisible((in_chs if bottle_in else out_chs) * bottle_ratio)
         groups = num_groups(group_size, mid_chs)
 
         self.shortcut = create_shortcut(
-            downsample, in_chs, out_chs,
-            stride=stride, dilation=dilation, apply_act=False, layers=layers,
+            downsample,
+            in_chs,
+            out_chs,
+            stride=stride,
+            dilation=dilation,
+            apply_act=False,
+            layers=layers,
+            **dd,
         )
 
-        self.conv1_1x1 = layers.conv_norm_act(in_chs, mid_chs, 1)
+        self.conv1_1x1 = layers.conv_norm_act(in_chs, mid_chs, 1, **dd)
         if extra_conv:
             self.conv2_kxk = layers.conv_norm_act(
-                mid_chs, mid_chs, kernel_size,
-                stride=stride, dilation=dilation[0], groups=groups, drop_layer=drop_block,
+                mid_chs,
+                mid_chs,
+                kernel_size,
+                stride=stride,
+                dilation=dilation[0],
+                groups=groups,
+                drop_layer=drop_block,
+                **dd,
             )
             stride = 1  # striding done via conv if enabled
         else:
             self.conv2_kxk = nn.Identity()
         opt_kwargs = {} if feat_size is None else dict(feat_size=feat_size)
         # FIXME need to dilate self attn to have dilated network support, moop moop
-        self.self_attn = layers.self_attn(mid_chs, stride=stride, **opt_kwargs)
-        self.post_attn = layers.norm_act(mid_chs) if post_attn_na else nn.Identity()
-        self.conv3_1x1 = layers.conv_norm_act(mid_chs, out_chs, 1, apply_act=False)
+        self.self_attn = layers.self_attn(mid_chs, stride=stride, **opt_kwargs, **dd)
+        self.post_attn = layers.norm_act(mid_chs, **dd) if post_attn_na else nn.Identity()
+        self.conv3_1x1 = layers.conv_norm_act(mid_chs, out_chs, 1, apply_act=False, **dd)
         self.drop_path = DropPath(drop_path_rate) if drop_path_rate > 0. else nn.Identity()
         self.act = nn.Identity() if linear_out else layers.act(inplace=True)
 
@@ -901,7 +1146,7 @@ _block_registry = dict(
 )
 
 
-def register_block(block_type:str, block_fn: nn.Module):
+def register_block(block_type: str, block_fn: nn.Module):
     _block_registry[block_type] = block_fn
 
 
@@ -917,7 +1162,7 @@ class Stem(nn.Sequential):
     def __init__(
             self,
             in_chs: int,
-            out_chs: int,
+            out_chs: Union[int, List[int], Tuple[int, ...]],
             kernel_size: int = 3,
             stride: int = 4,
             pool: str = 'maxpool',
@@ -925,7 +1170,10 @@ class Stem(nn.Sequential):
             num_act: Optional[int] = None,
             chs_decay: float = 0.5,
             layers: LayerFn = None,
+            device=None,
+            dtype=None,
     ):
+        dd = {'device': device, 'dtype': dtype}
         super().__init__()
         assert stride in (2, 4)
         layers = layers or LayerFn()
@@ -956,15 +1204,24 @@ class Stem(nn.Sequential):
             if i > 0 and s > 1:
                 last_feat_idx = i - 1
                 self.feature_info.append(dict(num_chs=prev_chs, reduction=curr_stride, module=prev_feat, stage=0))
-            self.add_module(conv_name, layer_fn(prev_chs, ch, kernel_size=kernel_size, stride=s))
+            self.add_module(conv_name, layer_fn(prev_chs, ch, kernel_size=kernel_size, stride=s, **dd))
             prev_chs = ch
             curr_stride *= s
             prev_feat = conv_name
 
-        if pool and 'max' in pool.lower():
+        if pool:
+            pool = pool.lower()
+            assert pool in ('max', 'maxpool', 'avg', 'avgpool', 'max2', 'avg2')
             last_feat_idx = i
             self.feature_info.append(dict(num_chs=prev_chs, reduction=curr_stride, module=prev_feat, stage=0))
-            self.add_module('pool', nn.MaxPool2d(3, 2, 1))
+            if pool == 'max2':
+                self.add_module('pool', nn.MaxPool2d(2))
+            elif pool == 'avg2':
+                self.add_module('pool', nn.AvgPool2d(2))
+            elif 'max' in pool:
+                self.add_module('pool', nn.MaxPool2d(kernel_size=3, stride=2, padding=1))
+            elif 'avg' in pool:
+                self.add_module('pool', nn.AvgPool2d(kernel_size=3, stride=2, padding=1, count_include_pad=False))
             curr_stride *= 2
             prev_feat = 'pool'
 
@@ -988,35 +1245,41 @@ def create_byob_stem(
         pool_type: str = '',
         feat_prefix: str = 'stem',
         layers: LayerFn = None,
+        device=None,
+        dtype=None,
 ):
+    dd = {'device': device, 'dtype': dtype}
     layers = layers or LayerFn()
     assert stem_type in ('', 'quad', 'quad2', 'tiered', 'deep', 'rep', 'one', '7x7', '3x3')
     if 'quad' in stem_type:
         # based on NFNet stem, stack of 4 3x3 convs
         num_act = 2 if 'quad2' in stem_type else None
-        stem = Stem(in_chs, out_chs, num_rep=4, num_act=num_act, pool=pool_type, layers=layers)
+        stem = Stem(in_chs, out_chs, num_rep=4, num_act=num_act, pool=pool_type, layers=layers, **dd)
     elif 'tiered' in stem_type:
         # 3x3 stack of 3 convs as in my ResNet-T
-        stem = Stem(in_chs, (3 * out_chs // 8, out_chs // 2, out_chs), pool=pool_type, layers=layers)
+        stem = Stem(in_chs, (3 * out_chs // 8, out_chs // 2, out_chs), pool=pool_type, layers=layers, **dd)
     elif 'deep' in stem_type:
         # 3x3 stack of 3 convs as in ResNet-D
-        stem = Stem(in_chs, out_chs, num_rep=3, chs_decay=1.0, pool=pool_type, layers=layers)
+        stem = Stem(in_chs, out_chs, num_rep=3, chs_decay=1.0, pool=pool_type, layers=layers, **dd)
     elif 'rep' in stem_type:
-        stem = RepVggBlock(in_chs, out_chs, stride=2, layers=layers)
+        stem = RepVggBlock(in_chs, out_chs, stride=2, layers=layers, **dd)
     elif 'one' in stem_type:
-        stem = MobileOneBlock(in_chs, out_chs, kernel_size=3, stride=2, layers=layers)
+        stem = MobileOneBlock(in_chs, out_chs, kernel_size=3, stride=2, layers=layers, **dd)
     elif '7x7' in stem_type:
         # 7x7 stem conv as in ResNet
         if pool_type:
-            stem = Stem(in_chs, out_chs, 7, num_rep=1, pool=pool_type, layers=layers)
+            stem = Stem(in_chs, out_chs, 7, num_rep=1, pool=pool_type, layers=layers, **dd)
         else:
-            stem = layers.conv_norm_act(in_chs, out_chs, 7, stride=2)
+            stem = layers.conv_norm_act(in_chs, out_chs, 7, stride=2, **dd)
     else:
-        # 3x3 stem conv as in RegNet is the default
-        if pool_type:
-            stem = Stem(in_chs, out_chs, 3, num_rep=1, pool=pool_type, layers=layers)
+        if isinstance(out_chs, (tuple, list)):
+            stem = Stem(in_chs, out_chs, 3, pool=pool_type, layers=layers, **dd)
         else:
-            stem = layers.conv_norm_act(in_chs, out_chs, 3, stride=2)
+            # 3x3 stem conv as in RegNet is the default
+            if pool_type:
+                stem = Stem(in_chs, out_chs, 3, num_rep=1, pool=pool_type, layers=layers, **dd)
+            else:
+                stem = layers.conv_norm_act(in_chs, out_chs, 3, stride=2, **dd)
 
     if isinstance(stem, Stem):
         feature_info = [dict(f, module='.'.join([feat_prefix, f['module']])) for f in stem.feature_info]
@@ -1077,21 +1340,55 @@ def update_block_kwargs(block_kwargs: Dict[str, Any], block_cfg: ByoBlockCfg, mo
     block_kwargs.update(override_kwargs(block_cfg.block_kwargs, model_cfg.block_kwargs))
 
 
+def drop_blocks(
+        drop_prob: float = 0.,
+        block_size: int = 3,
+        num_stages: int = 4,
+) -> List[Optional[partial]]:
+    """Create DropBlock layer partials for each stage.
+
+    DropBlock is applied to the last two stages only, following common practice.
+    The block_size specifies the size for the final stage; the second-to-last
+    stage uses a larger block size scaled to account for 2x larger feature maps.
+
+    Args:
+        drop_prob: Drop probability for DropBlock.
+        block_size: Block size for the final stage. Second-to-last stage
+            uses `block_size * 2 - 1` to scale with feature map size.
+        num_stages: Number of stages in the model.
+
+    Returns:
+        List of DropBlock partial instances or None for each stage.
+    """
+    assert num_stages >= 2
+    dbs = [None] * num_stages
+    if drop_prob:
+        # Scale block size for second-to-last stage (2x larger feature maps)
+        dbs[-2] = partial(DropBlock2d, drop_prob=drop_prob, block_size=block_size * 2 - 1, gamma_scale=0.25)
+        dbs[-1] = partial(DropBlock2d, drop_prob=drop_prob, block_size=block_size, gamma_scale=1.00)
+    return dbs
+
+
 def create_byob_stages(
         cfg: ByoModelCfg,
         drop_path_rate: float,
         output_stride: int,
         stem_feat: Dict[str, Any],
+        drop_block_rate: float = 0.,
+        drop_block_size: int = 3,
         feat_size: Optional[int] = None,
         layers: Optional[LayerFn] = None,
         block_kwargs_fn: Optional[Callable] = update_block_kwargs,
+        device=None,
+        dtype=None,
 ):
-
     layers = layers or LayerFn()
     feature_info = []
     block_cfgs = [expand_blocks_cfg(s) for s in cfg.blocks]
+    num_stages = len(block_cfgs)
     depths = [sum([bc.d for bc in stage_bcs]) for stage_bcs in block_cfgs]
-    dpr = [x.tolist() for x in torch.linspace(0, drop_path_rate, sum(depths)).split(depths)]
+    dpr = calculate_drop_path_rates(drop_path_rate, depths, stagewise=True)
+    dbs = drop_blocks(drop_block_rate, drop_block_size, num_stages)
     dilation = 1
     net_stride = stem_feat['reduction']
     prev_chs = stem_feat['num_chs']
@@ -1121,8 +1418,11 @@ def create_byob_stages(
                 group_size=group_size,
                 bottle_ratio=block_cfg.br,
                 downsample=cfg.downsample,
+                drop_block=dbs[stage_idx],
                 drop_path_rate=dpr[stage_idx][block_idx],
                 layers=layers,
+                device=device,
+                dtype=dtype,
             )
             if block_cfg.type in ('self_attn',):
                 # add feat_size arg for blocks that support/need it
@@ -1138,13 +1438,16 @@ def create_byob_stages(
         prev_feat = dict(num_chs=prev_chs, reduction=net_stride, module=f'stages.{stage_idx}', stage=stage_idx + 1)
 
     feature_info.append(prev_feat)
-    return nn.Sequential(*stages), feature_info
+    return nn.Sequential(*stages), feature_info, feat_size
 
 
-def get_layer_fns(cfg: ByoModelCfg):
+def get_layer_fns(cfg: ByoModelCfg, allow_aa: bool = True):
     act = get_act_layer(cfg.act_layer)
     norm_act = get_norm_act_layer(norm_layer=cfg.norm_layer, act_layer=act)
-    conv_norm_act = partial(ConvNormAct, norm_layer=cfg.norm_layer, act_layer=act)
+    if cfg.aa_layer and allow_aa:
+        conv_norm_act = partial(ConvNormAct, norm_layer=cfg.norm_layer, act_layer=act, aa_layer=cfg.aa_layer)
+    else:
+        conv_norm_act = partial(ConvNormAct, norm_layer=cfg.norm_layer, act_layer=act)
     attn = partial(get_attn(cfg.attn_layer), **cfg.attn_kwargs) if cfg.attn_layer else None
     self_attn = partial(get_attn(cfg.self_attn_layer), **cfg.self_attn_kwargs) if cfg.self_attn_layer else None
     layer_fn = LayerFn(conv_norm_act=conv_norm_act, norm_act=norm_act, act=act, attn=attn, self_attn=self_attn)
@@ -1152,24 +1455,29 @@ def get_layer_fns(cfg: ByoModelCfg):
 
 
 class ByobNet(nn.Module):
-    """ 'Bring-your-own-blocks' Net
+    """Bring-your-own-blocks Network.
 
     A flexible network backbone that allows building model stem + blocks via
     dataclass cfg definition w/ factory functions for module instantiation.
 
     Current assumption is that both stem and blocks are in conv-bn-act order (w/ block ending in act).
     """
+
     def __init__(
             self,
             cfg: ByoModelCfg,
             num_classes: int = 1000,
             in_chans: int = 3,
-            global_pool: str = 'avg',
+            global_pool: Optional[str] = None,
             output_stride: int = 32,
             img_size: Optional[Union[int, Tuple[int, int]]] = None,
             drop_rate: float = 0.,
-            drop_path_rate: float =0.,
+            drop_block_rate: float = 0.,
+            drop_block_size: int = 3,
+            drop_path_rate: float = 0.,
             zero_init_last: bool = True,
+            device=None,
+            dtype=None,
             **kwargs,
     ):
         """
@@ -1181,34 +1489,52 @@ class ByobNet(nn.Module):
             output_stride: Output stride of network, one of (8, 16, 32).
             img_size: Image size for fixed image size models (i.e. self-attn).
             drop_rate: Classifier dropout rate.
+            drop_block_rate: DropBlock drop rate.
+            drop_block_size: DropBlock block size for final stage (scales up for earlier stages).
             drop_path_rate: Stochastic depth drop-path rate.
             zero_init_last: Zero-init last weight of residual path.
             **kwargs: Extra kwargs overlayed onto cfg.
         """
         super().__init__()
+        dd = {'device': device, 'dtype': dtype}
         self.num_classes = num_classes
+        self.in_chans = in_chans
         self.drop_rate = drop_rate
         self.grad_checkpointing = False
 
         cfg = replace(cfg, **kwargs)  # overlay kwargs onto cfg
-        layers = get_layer_fns(cfg)
+        stem_layers = get_layer_fns(cfg, allow_aa=False)  # keep aa off for stem-layers
+        stage_layers = get_layer_fns(cfg)
         if cfg.fixed_input_size:
             assert img_size is not None, 'img_size argument is required for fixed input size model'
         feat_size = to_2tuple(img_size) if img_size is not None else None
 
         self.feature_info = []
-        stem_chs = int(round((cfg.stem_chs or cfg.blocks[0].c) * cfg.width_factor))
-        self.stem, stem_feat = create_byob_stem(in_chans, stem_chs, cfg.stem_type, cfg.stem_pool, layers=layers)
+        if isinstance(cfg.stem_chs, (list, tuple)):
+            stem_chs = [int(round(c * cfg.width_factor)) for c in cfg.stem_chs]
+        else:
+            stem_chs = int(round((cfg.stem_chs or cfg.blocks[0].c) * cfg.width_factor))
+        self.stem, stem_feat = create_byob_stem(
+            in_chs=in_chans,
+            out_chs=stem_chs,
+            stem_type=cfg.stem_type,
+            pool_type=cfg.stem_pool,
+            layers=stem_layers,
+            **dd,
+        )
         self.feature_info.extend(stem_feat[:-1])
         feat_size = reduce_feat_size(feat_size, stride=stem_feat[-1]['reduction'])
 
-        self.stages, stage_feat = create_byob_stages(
+        self.stages, stage_feat, feat_size = create_byob_stages(
             cfg,
             drop_path_rate,
             output_stride,
             stem_feat[-1],
-            layers=layers,
+            drop_block_rate=drop_block_rate,
+            drop_block_size=drop_block_size,
+            layers=stage_layers,
             feat_size=feat_size,
+            **dd,
         )
         self.feature_info.extend(stage_feat[:-1])
         reduction = stage_feat[-1]['reduction']
@@ -1216,7 +1542,7 @@ class ByobNet(nn.Module):
         prev_chs = stage_feat[-1]['num_chs']
         if cfg.num_features:
             self.num_features = int(round(cfg.width_factor * cfg.num_features))
-            self.final_conv = layers.conv_norm_act(prev_chs, self.num_features, 1)
+            self.final_conv = stage_layers.conv_norm_act(prev_chs, self.num_features, 1, **dd)
         else:
             self.num_features = prev_chs
             self.final_conv = nn.Identity()
@@ -1224,18 +1550,78 @@ class ByobNet(nn.Module):
             dict(num_chs=self.num_features, reduction=reduction, module='final_conv', stage=len(self.stages))]
         self.stage_ends = [f['stage'] for f in self.feature_info]
 
-        self.head = ClassifierHead(
-            self.num_features,
-            num_classes,
-            pool_type=global_pool,
-            drop_rate=self.drop_rate,
-        )
+        self.head_hidden_size = self.num_features
+        assert cfg.head_type in ('', 'classifier', 'mlp', 'attn_abs', 'attn_rot')
+        if cfg.head_type == 'mlp':
+            if global_pool is None:
+                global_pool = 'avg'
+            self.head = NormMlpClassifierHead(
+                self.num_features,
+                num_classes,
+                hidden_size=cfg.head_hidden_size,
+                pool_type=global_pool,
+                norm_layer=cfg.norm_layer,
+                act_layer=cfg.act_layer,
+                drop_rate=self.drop_rate,
+                **dd,
+            )
+            self.head_hidden_size = self.head.hidden_size
+        elif cfg.head_type == 'attn_abs':
+            if global_pool is None:
+                global_pool = 'token'
+            assert global_pool in ('', 'token')
+            self.head = AttentionPool2d(
+                self.num_features,
+                embed_dim=cfg.head_hidden_size,
+                out_features=num_classes,
+                feat_size=feat_size,
+                pool_type=global_pool,
+                drop_rate=self.drop_rate,
+                qkv_separate=True,
+                **dd,
+            )
+            self.head_hidden_size = self.head.embed_dim
+        elif cfg.head_type == 'attn_rot':
+            if global_pool is None:
+                global_pool = 'token'
+            assert global_pool in ('', 'token')
+            self.head = RotAttentionPool2d(
+                self.num_features,
+                embed_dim=cfg.head_hidden_size,
+                out_features=num_classes,
+                ref_feat_size=feat_size,
+                pool_type=global_pool,
+                drop_rate=self.drop_rate,
+                qkv_separate=True,
+                **dd,
+            )
+            self.head_hidden_size = self.head.embed_dim
+        else:
+            if global_pool is None:
+                global_pool = 'avg'
+            assert cfg.head_hidden_size is None
+            self.head = ClassifierHead(
+                self.num_features,
+                num_classes,
+                pool_type=global_pool,
+                drop_rate=self.drop_rate,
+                **dd,
+            )
+        self.global_pool = global_pool
 
         # init weights
         named_apply(partial(_init_weights, zero_init_last=zero_init_last), self)
 
     @torch.jit.ignore
-    def group_matcher(self, coarse=False):
+    def group_matcher(self, coarse: bool = False) -> Dict[str, Any]:
+        """Group matcher for parameter groups.
+
+        Args:
+            coarse: Whether to use coarse grouping.
+
+        Returns:
+            Dictionary mapping group names to patterns.
+        """
         matcher = dict(
             stem=r'^stem',
             blocks=[
@@ -1246,20 +1632,37 @@ class ByobNet(nn.Module):
         return matcher
 
     @torch.jit.ignore
-    def set_grad_checkpointing(self, enable=True):
+    def set_grad_checkpointing(self, enable: bool = True) -> None:
+        """Enable or disable gradient checkpointing.
+
+        Args:
+            enable: Whether to enable gradient checkpointing.
+        """
         self.grad_checkpointing = enable
 
     @torch.jit.ignore
-    def get_classifier(self):
+    def get_classifier(self) -> nn.Module:
+        """Get classifier module.
+
+        Returns:
+            Classifier module.
+        """
         return self.head.fc
 
-    def reset_classifier(self, num_classes, global_pool='avg'):
+    def reset_classifier(self, num_classes: int, global_pool: Optional[str] = None) -> None:
+        """Reset classifier.
+
+        Args:
+            num_classes: Number of classes for new classifier.
+            global_pool: Global pooling type.
+        """
+        self.num_classes = num_classes
         self.head.reset(num_classes, global_pool)
 
     def forward_intermediates(
             self,
             x: torch.Tensor,
-            indices: Optional[Union[int, List[int], Tuple[int]]] = None,
+            indices: Optional[Union[int, List[int]]] = None,
             norm: bool = False,
             stop_early: bool = False,
             output_fmt: str = 'NCHW',
@@ -1300,7 +1703,10 @@ class ByobNet(nn.Module):
             stages = self.stages[:max_index]
         for stage in stages:
             feat_idx += 1
-            x = stage(x)
+            if self.grad_checkpointing and not torch.jit.is_scripting():
+                x = checkpoint_seq(stage, x)
+            else:
+                x = stage(x)
             if not exclude_final_conv and feat_idx == last_idx:
                 # default feature_info for this model uses final_conv as the last feature output (if present)
                 x = self.final_conv(x)
@@ -1317,11 +1723,19 @@ class ByobNet(nn.Module):
 
     def prune_intermediate_layers(
             self,
-            indices: Union[int, List[int], Tuple[int]] = 1,
+            indices: Union[int, List[int]] = 1,
             prune_norm: bool = False,
             prune_head: bool = True,
-    ):
-        """ Prune layers not required for specified intermediates.
+    ) -> List[int]:
+        """Prune layers not required for specified intermediates.
+
+        Args:
+            indices: Indices of intermediate layers to keep.
+            prune_norm: Whether to prune normalization layer.
+            prune_head: Whether to prune the classifier head.
+
+        Returns:
+            List of indices that were kept.
         """
         take_indices, max_index = feature_take_indices(len(self.stage_ends), indices)
         max_index = self.stage_ends[max_index]
@@ -1332,8 +1746,15 @@ class ByobNet(nn.Module):
             self.reset_classifier(0, '')
         return take_indices
 
+    def forward_features(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass through feature extraction.
 
-    def forward_features(self, x):
+        Args:
+            x: Input tensor.
+
+        Returns:
+            Feature tensor.
+        """
         x = self.stem(x)
         if self.grad_checkpointing and not torch.jit.is_scripting():
             x = checkpoint_seq(self.stages, x)
@@ -1342,16 +1763,40 @@ class ByobNet(nn.Module):
         x = self.final_conv(x)
         return x
 
-    def forward_head(self, x, pre_logits: bool = False):
+    def forward_head(self, x: torch.Tensor, pre_logits: bool = False) -> torch.Tensor:
+        """Forward pass through head.
+
+        Args:
+            x: Input features.
+            pre_logits: Return features before final linear layer.
+
+        Returns:
+            Classification logits or features.
+        """
         return self.head(x, pre_logits=pre_logits) if pre_logits else self.head(x)
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass.
+
+        Args:
+            x: Input tensor.
+
+        Returns:
+            Output logits.
+        """
         x = self.forward_features(x)
         x = self.forward_head(x)
         return x
 
 
-def _init_weights(module, name='', zero_init_last=False):
+def _init_weights(module: nn.Module, name: str = '', zero_init_last: bool = False) -> None:
+    """Initialize weights.
+
+    Args:
+        module: Module to initialize.
+        name: Module name.
+        zero_init_last: Zero-initialize last layer.
+    """
     if isinstance(module, nn.Conv2d):
         fan_out = module.kernel_size[0] * module.kernel_size[1] * module.out_channels
         fan_out //= module.groups
@@ -1832,33 +2277,224 @@ model_cfgs = dict(
         stem_type='one',
         stem_chs=64,
     ),
+
+    resnet50_clip=ByoModelCfg(
+        blocks=(
+            ByoBlockCfg(type='bottle', d=3, c=256, s=1, br=0.25),
+            ByoBlockCfg(type='bottle', d=4, c=512, s=2, br=0.25),
+            ByoBlockCfg(type='bottle', d=6, c=1024, s=2, br=0.25),
+            ByoBlockCfg(type='bottle', d=3, c=2048, s=2, br=0.25),
+        ),
+        stem_chs=(32, 32, 64),
+        stem_type='',
+        stem_pool='avg2',
+        downsample='avg',
+        aa_layer='avg',
+        head_type='attn_abs',
+    ),
+    resnet101_clip=ByoModelCfg(
+        blocks=(
+            ByoBlockCfg(type='bottle', d=3, c=256, s=1, br=0.25),
+            ByoBlockCfg(type='bottle', d=4, c=512, s=2, br=0.25),
+            ByoBlockCfg(type='bottle', d=23, c=1024, s=2, br=0.25),
+            ByoBlockCfg(type='bottle', d=3, c=2048, s=2, br=0.25),
+        ),
+        stem_chs=(32, 32, 64),
+        stem_type='',
+        stem_pool='avg2',
+        downsample='avg',
+        aa_layer='avg',
+        head_type='attn_abs',
+    ),
+    resnet50x4_clip=ByoModelCfg(
+        blocks=(
+            ByoBlockCfg(type='bottle', d=4, c=256, s=1, br=0.25),
+            ByoBlockCfg(type='bottle', d=6, c=512, s=2, br=0.25),
+            ByoBlockCfg(type='bottle', d=10, c=1024, s=2, br=0.25),
+            ByoBlockCfg(type='bottle', d=6, c=2048, s=2, br=0.25),
+        ),
+        width_factor=1.25,
+        stem_chs=(32, 32, 64),
+        stem_type='',
+        stem_pool='avg2',
+        downsample='avg',
+        aa_layer='avg',
+        head_type='attn_abs',
+    ),
+    resnet50x16_clip=ByoModelCfg(
+        blocks=(
+            ByoBlockCfg(type='bottle', d=6, c=256, s=1, br=0.25),
+            ByoBlockCfg(type='bottle', d=8, c=512, s=2, br=0.25),
+            ByoBlockCfg(type='bottle', d=18, c=1024, s=2, br=0.25),
+            ByoBlockCfg(type='bottle', d=8, c=2048, s=2, br=0.25),
+        ),
+        width_factor=1.5,
+        stem_chs=(32, 32, 64),
+        stem_type='',
+        stem_pool='avg2',
+        downsample='avg',
+        aa_layer='avg',
+        head_type='attn_abs',
+    ),
+    resnet50x64_clip=ByoModelCfg(
+        blocks=(
+            ByoBlockCfg(type='bottle', d=3, c=256, s=1, br=0.25),
+            ByoBlockCfg(type='bottle', d=15, c=512, s=2, br=0.25),
+            ByoBlockCfg(type='bottle', d=36, c=1024, s=2, br=0.25),
+            ByoBlockCfg(type='bottle', d=10, c=2048, s=2, br=0.25),
+        ),
+        width_factor=2.0,
+        stem_chs=(32, 32, 64),
+        stem_type='',
+        stem_pool='avg2',
+        downsample='avg',
+        aa_layer='avg',
+        head_type='attn_abs',
+    ),
+
+    resnet50_mlp=ByoModelCfg(
+        blocks=(
+            ByoBlockCfg(type='bottle', d=3, c=256, s=1, br=0.25),
+            ByoBlockCfg(type='bottle', d=4, c=512, s=2, br=0.25),
+            ByoBlockCfg(type='bottle', d=6, c=1024, s=2, br=0.25),
+            ByoBlockCfg(type='bottle', d=3, c=2048, s=2, br=0.25),
+        ),
+        stem_chs=(32, 32, 64),
+        stem_type='',
+        stem_pool='avg2',
+        downsample='avg',
+        aa_layer='avg',
+        head_hidden_size=1024,
+        head_type='mlp',
+    ),
+
+    test_byobnet=ByoModelCfg(
+        blocks=(
+            ByoBlockCfg(type='edge', d=1, c=32, s=2, gs=0, br=0.5),
+            ByoBlockCfg(type='dark', d=1, c=64, s=2, gs=0, br=0.5),
+            ByoBlockCfg(type='basic', d=1, c=128, s=2, gs=32, br=0.25),
+            ByoBlockCfg(type='bottle', d=1, c=256, s=2, gs=64, br=0.25),
+        ),
+        stem_chs=24,
+        downsample='avg',
+        stem_pool='',
+        act_layer='relu',
+        attn_layer='se',
+        attn_kwargs=dict(rd_ratio=0.25),
+    ),
 )
+for k in ('resnet50_clip', 'resnet101_clip', 'resnet50x4_clip', 'resnet50x16_clip', 'resnet50x64_clip'):
+    model_cfgs[k + '_gap'] = replace(model_cfgs[k], head_type='classifier')
 
 
-def _create_byobnet(variant, pretrained=False, **kwargs):
+def _convert_openai_clip(
+        state_dict: Dict[str, torch.Tensor],
+        model: ByobNet,
+        prefix: str = 'visual.',
+) -> Dict[str, torch.Tensor]:
+    model_has_attn_pool = isinstance(model.head, (RotAttentionPool2d, AttentionPool2d))
+    import re
+
+    def _stage_sub(m):
+        stage_idx = int(m.group(1)) - 1
+        layer_idx, layer_type, layer_id = int(m.group(2)), m.group(3), int(m.group(4))
+        prefix_str = f'stages.{stage_idx}.{layer_idx}.'
+        id_map = {1: 'conv1_1x1.', 2: 'conv2_kxk.', 3: 'conv3_1x1.'}
+        suffix_str = id_map[layer_id] + layer_type
+        return prefix_str + suffix_str
+
+    def _down_sub(m):
+        stage_idx = int(m.group(1)) - 1
+        layer_idx, layer_id = int(m.group(2)), int(m.group(3))
+        return f'stages.{stage_idx}.{layer_idx}.shortcut.' + ('conv.conv' if layer_id == 0 else 'conv.bn')
+
+    out_dict = {}
+    for k, v in state_dict.items():
+        if not k.startswith(prefix):
+            continue
+        k = re.sub(rf'{prefix}conv([0-9])', r'stem.conv\1.conv', k)
+        k = re.sub(rf'{prefix}bn([0-9])', r'stem.conv\1.bn', k)
+        k = re.sub(rf'{prefix}layer([0-9])\.([0-9]+)\.([a-z]+)([0-9])', _stage_sub, k)
+        k = re.sub(rf'{prefix}layer([0-9])\.([0-9]+)\.downsample\.([0-9])', _down_sub, k)
+        if k.startswith(f'{prefix}attnpool'):
+            if not model_has_attn_pool:
+                continue
+            k = k.replace(prefix + 'attnpool', 'head')  # 'attn_pool')
+            k = k.replace('positional_embedding', 'pos_embed')
+            k = k.replace('q_proj', 'q')
+            k = k.replace('k_proj', 'k')
+            k = k.replace('v_proj', 'v')
+            k = k.replace('c_proj', 'proj')
+        out_dict[k] = v
+
+    return out_dict
+
+
+def checkpoint_filter_fn(
+        state_dict: Dict[str, torch.Tensor],
+        model: ByobNet
+):
+    if 'visual.conv1.weight' in state_dict:
+        state_dict = _convert_openai_clip(state_dict, model)
+    return state_dict
+
+
+def _create_byobnet(variant: str, pretrained: bool = False, **kwargs) -> ByobNet:
+    """Create a ByobNet model.
+
+    Args:
+        variant: Model variant name.
+        pretrained: Load pretrained weights.
+        **kwargs: Additional model arguments.
+
+    Returns:
+        ByobNet model instance.
+    """
     return build_model_with_cfg(
         ByobNet, variant, pretrained,
         model_cfg=model_cfgs[variant],
+        pretrained_filter_fn=checkpoint_filter_fn,
         feature_cfg=dict(flatten_sequential=True),
-        **kwargs)
+        **kwargs,
+    )
 
 
-def _cfg(url='', **kwargs):
+def _cfg(url: str = '', **kwargs) -> Dict[str, Any]:
+    """Create default configuration dictionary.
+
+    Args:
+        url: Model weight URL.
+        **kwargs: Additional configuration options.
+
+    Returns:
+        Configuration dictionary.
+    """
     return {
         'url': url, 'num_classes': 1000, 'input_size': (3, 224, 224), 'pool_size': (7, 7),
         'crop_pct': 0.875, 'interpolation': 'bilinear',
         'mean': IMAGENET_DEFAULT_MEAN, 'std': IMAGENET_DEFAULT_STD,
         'first_conv': 'stem.conv', 'classifier': 'head.fc',
+        'license': 'apache-2.0',
         **kwargs
     }
 
 
-def _cfgr(url='', **kwargs):
+def _cfgr(url: str = '', **kwargs) -> Dict[str, Any]:
+    """Create RepVGG configuration dictionary.
+
+    Args:
+        url: Model weight URL.
+        **kwargs: Additional configuration options.
+
+    Returns:
+        Configuration dictionary.
+    """
     return {
         'url': url, 'num_classes': 1000, 'input_size': (3, 256, 256), 'pool_size': (8, 8),
         'crop_pct': 0.9, 'interpolation': 'bicubic',
         'mean': IMAGENET_DEFAULT_MEAN, 'std': IMAGENET_DEFAULT_STD,
         'first_conv': 'stem.conv1.conv', 'classifier': 'head.fc',
+        'license': 'apache-2.0',
         **kwargs
     }
 
@@ -2012,26 +2648,149 @@ default_cfgs = generate_default_cfgs({
         hf_hub_id='timm/',
         crop_pct=0.875,
         first_conv=('stem.conv_kxk.0.conv', 'stem.conv_scale.conv'),
+        license='mobileone-license',
     ),
     'mobileone_s1.apple_in1k': _cfg(
         hf_hub_id='timm/',
         crop_pct=0.9,
         first_conv=('stem.conv_kxk.0.conv', 'stem.conv_scale.conv'),
+        license='mobileone-license',
     ),
     'mobileone_s2.apple_in1k': _cfg(
         hf_hub_id='timm/',
         crop_pct=0.9,
         first_conv=('stem.conv_kxk.0.conv', 'stem.conv_scale.conv'),
+        license='mobileone-license',
     ),
     'mobileone_s3.apple_in1k': _cfg(
         hf_hub_id='timm/',
         crop_pct=0.9,
         first_conv=('stem.conv_kxk.0.conv', 'stem.conv_scale.conv'),
+        license='mobileone-license',
     ),
     'mobileone_s4.apple_in1k': _cfg(
         hf_hub_id='timm/',
         crop_pct=0.9,
         first_conv=('stem.conv_kxk.0.conv', 'stem.conv_scale.conv'),
+        license='mobileone-license',
+    ),
+
+    # original attention pool head variants
+    'resnet50_clip.openai': _cfgr(
+        hf_hub_id='timm/',
+        num_classes=1024, mean=OPENAI_CLIP_MEAN, std=OPENAI_CLIP_STD,
+        fixed_input_size=True, input_size=(3, 224, 224), pool_size=(7, 7),
+        classifier='head.proj',
+        license='mit',
+    ),
+    'resnet101_clip.openai': _cfgr(
+        hf_hub_id='timm/',
+        num_classes=512, mean=OPENAI_CLIP_MEAN, std=OPENAI_CLIP_STD,
+        fixed_input_size=True, input_size=(3, 224, 224), pool_size=(7, 7),
+        classifier='head.proj',
+        license='mit',
+    ),
+    'resnet50x4_clip.openai': _cfgr(
+        hf_hub_id='timm/',
+        num_classes=640, mean=OPENAI_CLIP_MEAN, std=OPENAI_CLIP_STD,
+        fixed_input_size=True, input_size=(3, 288, 288), pool_size=(9, 9),
+        classifier='head.proj',
+        license='mit',
+    ),
+    'resnet50x16_clip.openai': _cfgr(
+        hf_hub_id='timm/',
+        num_classes=768, mean=OPENAI_CLIP_MEAN, std=OPENAI_CLIP_STD,
+        fixed_input_size=True, input_size=(3, 384, 384), pool_size=(12, 12),
+        classifier='head.proj',
+        license='mit',
+    ),
+    'resnet50x64_clip.openai': _cfgr(
+        hf_hub_id='timm/',
+        num_classes=1024, mean=OPENAI_CLIP_MEAN, std=OPENAI_CLIP_STD,
+        fixed_input_size=True, input_size=(3, 448, 448), pool_size=(14, 14),
+        classifier='head.proj',
+        license='mit',
+    ),
+    'resnet50_clip.cc12m': _cfgr(
+        hf_hub_id='timm/',
+        num_classes=1024, mean=OPENAI_CLIP_MEAN, std=OPENAI_CLIP_STD,
+        fixed_input_size=True, input_size=(3, 224, 224), pool_size=(7, 7),
+        classifier='head.proj',
+        license='mit',
+    ),
+    'resnet50_clip.yfcc15m': _cfgr(
+        hf_hub_id='timm/',
+        num_classes=1024, mean=OPENAI_CLIP_MEAN, std=OPENAI_CLIP_STD,
+        fixed_input_size=True, input_size=(3, 224, 224), pool_size=(7, 7),
+        classifier='head.proj',
+        license='mit',
+    ),
+    'resnet101_clip.yfcc15m': _cfgr(
+        hf_hub_id='timm/',
+        num_classes=512, mean=OPENAI_CLIP_MEAN, std=OPENAI_CLIP_STD,
+        fixed_input_size=True, input_size=(3, 224, 224), pool_size=(7, 7),
+        classifier='head.proj',
+        license='mit',
+    ),
+
+    # avg-pool w/ optional standard classifier head variants
+    'resnet50_clip_gap.openai': _cfgr(
+        hf_hub_id='timm/',
+        num_classes=0, mean=OPENAI_CLIP_MEAN, std=OPENAI_CLIP_STD,
+        input_size=(3, 224, 224), pool_size=(7, 7),
+        license='mit',
+    ),
+    'resnet101_clip_gap.openai': _cfgr(
+        hf_hub_id='timm/',
+        num_classes=0, mean=OPENAI_CLIP_MEAN, std=OPENAI_CLIP_STD,
+        input_size=(3, 224, 224), pool_size=(7, 7),
+        license='mit',
+    ),
+    'resnet50x4_clip_gap.openai': _cfgr(
+        hf_hub_id='timm/',
+        num_classes=0, mean=OPENAI_CLIP_MEAN, std=OPENAI_CLIP_STD,
+        input_size=(3, 288, 288), pool_size=(9, 9),
+        license='mit',
+    ),
+    'resnet50x16_clip_gap.openai': _cfgr(
+        hf_hub_id='timm/',
+        num_classes=0, mean=OPENAI_CLIP_MEAN, std=OPENAI_CLIP_STD,
+        input_size=(3, 384, 384), pool_size=(12, 12),
+        license='mit',
+    ),
+    'resnet50x64_clip_gap.openai': _cfgr(
+        hf_hub_id='timm/',
+        num_classes=0, mean=OPENAI_CLIP_MEAN, std=OPENAI_CLIP_STD,
+        input_size=(3, 448, 448), pool_size=(14, 14),
+        license='mit',
+    ),
+    'resnet50_clip_gap.cc12m': _cfgr(
+        hf_hub_id='timm/',
+        num_classes=0, mean=OPENAI_CLIP_MEAN, std=OPENAI_CLIP_STD,
+        input_size=(3, 224, 224), pool_size=(7, 7),
+        license='mit',
+    ),
+    'resnet50_clip_gap.yfcc15m': _cfgr(
+        hf_hub_id='timm/',
+        num_classes=0, mean=OPENAI_CLIP_MEAN, std=OPENAI_CLIP_STD,
+        input_size=(3, 224, 224), pool_size=(7, 7),
+        license='mit',
+    ),
+    'resnet101_clip_gap.yfcc15m': _cfgr(
+        hf_hub_id='timm/',
+        num_classes=0, mean=OPENAI_CLIP_MEAN, std=OPENAI_CLIP_STD,
+        input_size=(3, 224, 224), pool_size=(7, 7),
+        license='mit',
+    ),
+
+    'resnet50_mlp.untrained': _cfgr(
+        input_size=(3, 256, 256), pool_size=(8, 8),
+    ),
+
+    'test_byobnet.r160_in1k': _cfgr(
+        hf_hub_id='timm/',
+        first_conv='stem.conv',
+        input_size=(3, 160, 160), crop_pct=0.95, pool_size=(5, 5),
     ),
 })
 
@@ -2335,3 +3094,87 @@ def mobileone_s4(pretrained=False, **kwargs) -> ByobNet:
     """
     """
     return _create_byobnet('mobileone_s4', pretrained=pretrained, **kwargs)
+
+
+@register_model
+def resnet50_clip(pretrained=False, **kwargs) -> ByobNet:
+    """ OpenAI Modified ResNet-50 CLIP image tower
+    """
+    return _create_byobnet('resnet50_clip', pretrained=pretrained, **kwargs)
+
+
+@register_model
+def resnet101_clip(pretrained=False, **kwargs) -> ByobNet:
+    """ OpenAI Modified ResNet-101 CLIP image tower
+    """
+    return _create_byobnet('resnet101_clip', pretrained=pretrained, **kwargs)
+
+
+@register_model
+def resnet50x4_clip(pretrained=False, **kwargs) -> ByobNet:
+    """ OpenAI Modified ResNet-50x4 CLIP image tower
+    """
+    return _create_byobnet('resnet50x4_clip', pretrained=pretrained, **kwargs)
+
+
+@register_model
+def resnet50x16_clip(pretrained=False, **kwargs) -> ByobNet:
+    """ OpenAI Modified ResNet-50x16 CLIP image tower
+    """
+    return _create_byobnet('resnet50x16_clip', pretrained=pretrained, **kwargs)
+
+
+@register_model
+def resnet50x64_clip(pretrained=False, **kwargs) -> ByobNet:
+    """ OpenAI Modified ResNet-50x64 CLIP image tower
+    """
+    return _create_byobnet('resnet50x64_clip', pretrained=pretrained, **kwargs)
+
+
+@register_model
+def resnet50_clip_gap(pretrained=False, **kwargs) -> ByobNet:
+    """ OpenAI Modified ResNet-50 CLIP image tower w/ avg pool (no attention pool)
+    """
+    return _create_byobnet('resnet50_clip_gap', pretrained=pretrained, **kwargs)
+
+
+@register_model
+def resnet101_clip_gap(pretrained=False, **kwargs) -> ByobNet:
+    """ OpenAI Modified ResNet-101 CLIP image tower w/ avg pool (no attention pool)
+    """
+    return _create_byobnet('resnet101_clip_gap', pretrained=pretrained, **kwargs)
+
+
+@register_model
+def resnet50x4_clip_gap(pretrained=False, **kwargs) -> ByobNet:
+    """ OpenAI Modified ResNet-50x4 CLIP image tower w/ avg pool (no attention pool)
+    """
+    return _create_byobnet('resnet50x4_clip_gap', pretrained=pretrained, **kwargs)
+
+
+@register_model
+def resnet50x16_clip_gap(pretrained=False, **kwargs) -> ByobNet:
+    """ OpenAI Modified ResNet-50x16 CLIP image tower w/ avg pool (no attention pool)
+    """
+    return _create_byobnet('resnet50x16_clip_gap', pretrained=pretrained, **kwargs)
+
+
+@register_model
+def resnet50x64_clip_gap(pretrained=False, **kwargs) -> ByobNet:
+    """ OpenAI Modified ResNet-50x64 CLIP image tower w/ avg pool (no attention pool)
+    """
+    return _create_byobnet('resnet50x64_clip_gap', pretrained=pretrained, **kwargs)
+
+
+@register_model
+def resnet50_mlp(pretrained=False, **kwargs) -> ByobNet:
+    """
+    """
+    return _create_byobnet('resnet50_mlp', pretrained=pretrained, **kwargs)
+
+
+@register_model
+def test_byobnet(pretrained=False, **kwargs) -> ByobNet:
+    """ Minimal test ResNet (BYOB based) model.
+    """
+    return _create_byobnet('test_byobnet', pretrained=pretrained, **kwargs)

@@ -12,28 +12,17 @@ import os
 import time
 from contextlib import suppress
 from functools import partial
+from sys import maxsize
 
 import numpy as np
 import pandas as pd
 import torch
 
-from timm.data import create_dataset, create_loader, resolve_data_config, ImageNetInfo, infer_imagenet_subset
+from timm.data import create_dataset, create_loader, resolve_data_config, ImageNetInfo, infer_imagenet_subset, \
+    CustomDatasetInfo, DatasetInfoLabelMapper
 from timm.layers import apply_test_time_pool
 from timm.models import create_model
 from timm.utils import AverageMeter, setup_default_logging, set_jit_fuser, ParseKwargs
-
-try:
-    from apex import amp
-    has_apex = True
-except ImportError:
-    has_apex = False
-
-has_native_amp = False
-try:
-    if getattr(torch.cuda.amp, 'autocast') is not None:
-        has_native_amp = True
-except AttributeError:
-    pass
 
 try:
     from functorch.compile import memory_efficient_fusion
@@ -75,8 +64,8 @@ parser.add_argument('--img-size', default=None, type=int,
                     metavar='N', help='Input image dimension, uses model default if empty')
 parser.add_argument('--in-chans', type=int, default=None, metavar='N',
                     help='Image input channels (default: None => 3)')
-parser.add_argument('--input-size', default=None, nargs=3, type=int,
-                    metavar='N N N', help='Input all image dimensions (d h w, e.g. --input-size 3 224 224), uses model default if empty')
+parser.add_argument('--input-size', default=None, nargs=3, type=int, metavar='N',
+                    help='Input all image dimensions (d h w, e.g. --input-size 3 224 224), uses model default if empty')
 parser.add_argument('--use-train-size', action='store_true', default=False,
                     help='force use of train input size, even when test size is specified in pretrained cfg')
 parser.add_argument('--crop-pct', default=None, type=float,
@@ -111,9 +100,13 @@ parser.add_argument('--amp', action='store_true', default=False,
                     help='use Native AMP for mixed precision training')
 parser.add_argument('--amp-dtype', default='float16', type=str,
                     help='lower precision AMP dtype (default: float16)')
+parser.add_argument('--model-dtype', default=None, type=str,
+                   help='Model dtype override (non-AMP) (default: float32)')
 parser.add_argument('--fuser', default='', type=str,
                     help="Select jit fuser. One of ('', 'te', 'old', 'nvfuser')")
 parser.add_argument('--model-kwargs', nargs='*', default={}, action=ParseKwargs)
+parser.add_argument('--torchcompile-mode', type=str, default=None,
+                    help="torch.compile mode (default: None).")
 
 scripting_group = parser.add_mutually_exclusive_group()
 scripting_group.add_argument('--torchscript', default=False, action='store_true',
@@ -151,6 +144,8 @@ parser.add_argument('--include-index', action='store_true', default=False,
                     help='include the class index in results')
 parser.add_argument('--exclude-output', action='store_true', default=False,
                     help='exclude logits/probs from results, just indices. topk must be set !=0.')
+parser.add_argument('--no-console-results', action='store_true', default=False,
+                    help='disable printing the inference results to the console')
 
 
 def main():
@@ -165,10 +160,15 @@ def main():
 
     device = torch.device(args.device)
 
-    # resolve AMP arguments based on PyTorch / Apex availability
+    model_dtype = None
+    if args.model_dtype:
+        assert args.model_dtype in ('float32', 'float16', 'bfloat16')
+        model_dtype = getattr(torch, args.model_dtype)
+
+    # resolve AMP arguments based on PyTorch availability
     amp_autocast = suppress
     if args.amp:
-        assert has_native_amp, 'Please update PyTorch to a version with native AMP (or use APEX).'
+        assert model_dtype is None or model_dtype == torch.float32, 'float32 model dtype must be used with AMP'
         assert args.amp_dtype in ('float16', 'bfloat16')
         amp_dtype = torch.bfloat16 if args.amp_dtype == 'bfloat16' else torch.float16
         amp_autocast = partial(torch.autocast, device_type=device.type, dtype=amp_dtype)
@@ -197,6 +197,9 @@ def main():
     if args.num_classes is None:
         assert hasattr(model, 'num_classes'), 'Model must have `num_classes` attr if not set on cmd line/config.'
         args.num_classes = model.num_classes
+    # Preserve metadata before TorchScript/compile/DataParallel wrappers, which do
+    # not consistently forward custom model attributes such as pretrained_cfg.
+    pretrained_cfg = dict(getattr(model, 'pretrained_cfg', {}) or {})
 
     _logger.info(
         f'Model {args.model} created, param count: {sum([m.numel() for m in model.parameters()])}')
@@ -206,7 +209,7 @@ def main():
     if args.test_pool:
         model, test_time_pool = apply_test_time_pool(model, data_config)
 
-    model = model.to(device)
+    model = model.to(device=device, dtype=model_dtype)
     model.eval()
     if args.channels_last:
         model = model.to(memory_format=torch.channels_last)
@@ -216,7 +219,7 @@ def main():
     elif args.torchcompile:
         assert has_compile, 'A version of torch w/ torch.compile() is required for --compile, possibly a nightly.'
         torch._dynamo.reset()
-        model = torch.compile(model, backend=args.torchcompile)
+        model = torch.compile(model, backend=args.torchcompile, mode=args.torchcompile_mode)
     elif args.aot_autograd:
         assert has_functorch, "functorch is needed for --aot-autograd"
         model = memory_efficient_fusion(model)
@@ -242,23 +245,40 @@ def main():
         use_prefetcher=True,
         num_workers=workers,
         device=device,
+        img_dtype=model_dtype or torch.float32,
         **data_config,
     )
 
     to_label = None
-    if args.label_type in ('name', 'description', 'detail'):
-        imagenet_subset = infer_imagenet_subset(model)
-        if imagenet_subset is not None:
-            dataset_info = ImageNetInfo(imagenet_subset)
-            if args.label_type == 'name':
-                to_label = lambda x: dataset_info.index_to_label_name(x)
-            elif args.label_type == 'detail':
-                to_label = lambda x: dataset_info.index_to_description(x, detailed=True)
-            else:
-                to_label = lambda x: dataset_info.index_to_description(x)
-            to_label = np.vectorize(to_label)
+    if args.label_type in ('name', 'description', 'detail', 'detailed'):
+        dataset_info = None
+        label_names = pretrained_cfg.get('label_names', None)
+        label_descriptions = pretrained_cfg.get('label_descriptions', None)
+        if label_names is not None:
+            # custom labels pushed with the model (e.g. fine-tuned on a non-ImageNet dataset)
+            dataset_info = CustomDatasetInfo(
+                label_names=label_names,
+                label_descriptions=label_descriptions,
+            )
         else:
-            _logger.error("Cannot deduce ImageNet subset from model, no labelling will be performed.")
+            imagenet_subset = infer_imagenet_subset({'num_classes': args.num_classes})
+            if imagenet_subset is not None:
+                dataset_info = ImageNetInfo(imagenet_subset)
+            else:
+                _logger.error("Cannot deduce ImageNet subset from model, no labelling will be performed.")
+        if dataset_info is not None:
+            to_label = DatasetInfoLabelMapper(dataset_info, label_type=args.label_type)
+            if args.num_classes:
+                coverage = to_label.coverage(args.num_classes)
+                if coverage.missing:
+                    _logger.warning(
+                        f'Label mapping covers {coverage.mapped} of {args.num_classes} classifier outputs; '
+                        'unmapped predictions will use <unmapped:INDEX>.')
+                if coverage.extra:
+                    _logger.warning(
+                        f'Label mapping contains {coverage.extra} indices outside the classifier output range; '
+                        'those labels will be ignored.')
+            to_label = np.vectorize(to_label, otypes=[object])
 
     top_k = min(args.topk, args.num_classes)
     batch_time = AverageMeter()
@@ -267,7 +287,7 @@ def main():
     all_labels = []
     all_outputs = []
     use_probs = args.output_type == 'prob'
-    with torch.no_grad():
+    with torch.inference_mode():
         for batch_idx, (input, _) in enumerate(loader):
 
             with amp_autocast():
@@ -285,7 +305,7 @@ def main():
                     np_labels = to_label(np_indices)
                     all_labels.append(np_labels)
 
-            all_outputs.append(output.cpu().numpy())
+            all_outputs.append(output.float().cpu().numpy())
 
             # measure elapsed time
             batch_time.update(time.time() - end)
@@ -339,16 +359,19 @@ def main():
         results_filename = f'{args.model}-{img_size}'
 
     if args.results_dir:
+        os.makedirs(args.results_dir, exist_ok=True)
         results_filename = os.path.join(args.results_dir, results_filename)
 
     for fmt in args.results_format:
         save_results(df, results_filename, fmt)
 
-    print(f'--result')
-    print(df.set_index(args.filename_col).to_json(orient='index', indent=4))
+    if not args.no_console_results:
+        print(f'--result')
+        print(df.set_index(args.filename_col).to_json(orient='index', indent=4))
 
 
 def save_results(df, results_filename, results_format='csv', filename_col='filename'):
+    np.set_printoptions(threshold=maxsize)
     results_filename += _FMT_EXT[results_format]
     if results_format == 'parquet':
         df.set_index(filename_col).to_parquet(results_filename)

@@ -7,15 +7,15 @@ Original model: https://github.com/mrT23/TResNet
 """
 from collections import OrderedDict
 from functools import partial
-from typing import Optional
+from typing import List, Optional, Tuple, Union, Type
 
 import torch
 import torch.nn as nn
 
-from timm.layers import SpaceToDepth, BlurPool2d, ClassifierHead, SEModule,\
-    ConvNormActAa, ConvNormAct, DropPath
+from timm.layers import SpaceToDepth, BlurPool2d, ClassifierHead, SEModule, ConvNormAct, DropPath, calculate_drop_path_rates
 from ._builder import build_model_with_cfg
-from ._manipulate import checkpoint_seq
+from ._features import feature_take_indices
+from ._manipulate import checkpoint, checkpoint_seq
 from ._registry import register_model, generate_default_cfgs, register_model_deprecations
 
 __all__ = ['TResNet']  # model_registry will add each entrypoint fn to this
@@ -26,30 +26,36 @@ class BasicBlock(nn.Module):
 
     def __init__(
             self,
-            inplanes,
-            planes,
-            stride=1,
-            downsample=None,
-            use_se=True,
-            aa_layer=None,
-            drop_path_rate=0.
-    ):
-        super(BasicBlock, self).__init__()
+            inplanes: int,
+            planes: int,
+            stride: int = 1,
+            downsample: Optional[nn.Module] = None,
+            use_se: bool = True,
+            aa_layer: Optional[Type[nn.Module]] = None,
+            drop_path_rate: float = 0.,
+            device=None,
+            dtype=None,
+    ) -> None:
+        dd = {'device': device, 'dtype': dtype}
+        super().__init__()
         self.downsample = downsample
         self.stride = stride
         act_layer = partial(nn.LeakyReLU, negative_slope=1e-3)
 
-        if stride == 1:
-            self.conv1 = ConvNormAct(inplanes, planes, kernel_size=3, stride=1, act_layer=act_layer)
-        else:
-            self.conv1 = ConvNormActAa(
-                inplanes, planes, kernel_size=3, stride=2, act_layer=act_layer, aa_layer=aa_layer)
-
-        self.conv2 = ConvNormAct(planes, planes, kernel_size=3, stride=1, apply_act=False, act_layer=None)
+        self.conv1 = ConvNormAct(
+            inplanes,
+            planes,
+            kernel_size=3,
+            stride=stride,
+            act_layer=act_layer,
+            aa_layer=aa_layer,
+            **dd,
+        )
+        self.conv2 = ConvNormAct(planes, planes, kernel_size=3, stride=1, apply_act=False, **dd)
         self.act = nn.ReLU(inplace=True)
 
         rd_chs = max(planes * self.expansion // 4, 64)
-        self.se = SEModule(planes * self.expansion, rd_channels=rd_chs) if use_se else None
+        self.se = SEModule(planes * self.expansion, rd_channels=rd_chs, **dd) if use_se else None
         self.drop_path = DropPath(drop_path_rate) if drop_path_rate > 0 else nn.Identity()
 
     def forward(self, x):
@@ -71,34 +77,38 @@ class Bottleneck(nn.Module):
 
     def __init__(
             self,
-            inplanes,
-            planes,
-            stride=1,
-            downsample=None,
-            use_se=True,
-            act_layer=None,
-            aa_layer=None,
-            drop_path_rate=0.,
-    ):
-        super(Bottleneck, self).__init__()
+            inplanes: int,
+            planes: int,
+            stride: int = 1,
+            downsample: Optional[nn.Module] = None,
+            use_se: bool = True,
+            act_layer: Optional[Type[nn.Module]] = None,
+            aa_layer: Optional[Type[nn.Module]] = None,
+            drop_path_rate: float = 0.,
+            device=None,
+            dtype=None,
+    ) -> None:
+        dd = {'device': device, 'dtype': dtype}
+        super().__init__()
         self.downsample = downsample
         self.stride = stride
         act_layer = act_layer or partial(nn.LeakyReLU, negative_slope=1e-3)
 
-        self.conv1 = ConvNormAct(
-            inplanes, planes, kernel_size=1, stride=1, act_layer=act_layer)
-        if stride == 1:
-            self.conv2 = ConvNormAct(
-                planes, planes, kernel_size=3, stride=1, act_layer=act_layer)
-        else:
-            self.conv2 = ConvNormActAa(
-                planes, planes, kernel_size=3, stride=2, act_layer=act_layer, aa_layer=aa_layer)
+        self.conv1 = ConvNormAct(inplanes, planes, kernel_size=1, stride=1, act_layer=act_layer, **dd)
+        self.conv2 = ConvNormAct(
+            planes,
+            planes,
+            kernel_size=3,
+            stride=stride,
+            act_layer=act_layer,
+            aa_layer=aa_layer,
+            **dd,
+        )
 
         reduction_chs = max(planes * self.expansion // 8, 64)
-        self.se = SEModule(planes, rd_channels=reduction_chs) if use_se else None
+        self.se = SEModule(planes, rd_channels=reduction_chs, **dd) if use_se else None
 
-        self.conv3 = ConvNormAct(
-            planes, planes * self.expansion, kernel_size=1, stride=1, apply_act=False, act_layer=None)
+        self.conv3 = ConvNormAct(planes, planes * self.expansion, kernel_size=1, stride=1, apply_act=False, **dd)
 
         self.drop_path = DropPath(drop_path_rate) if drop_path_rate > 0 else nn.Identity()
         self.act = nn.ReLU(inplace=True)
@@ -121,19 +131,23 @@ class Bottleneck(nn.Module):
 class TResNet(nn.Module):
     def __init__(
             self,
-            layers,
-            in_chans=3,
-            num_classes=1000,
-            width_factor=1.0,
-            v2=False,
-            global_pool='fast',
-            drop_rate=0.,
-            drop_path_rate=0.,
-    ):
+            layers: List[int],
+            in_chans: int = 3,
+            num_classes: int = 1000,
+            width_factor: float = 1.0,
+            v2: bool = False,
+            global_pool: str = 'fast',
+            drop_rate: float = 0.,
+            drop_path_rate: float = 0.,
+            device=None,
+            dtype=None,
+    ) -> None:
+        super().__init__()
+        dd = {'device': device, 'dtype': dtype}
         self.num_classes = num_classes
+        self.in_chans = in_chans
         self.drop_rate = drop_rate
         self.grad_checkpointing = False
-        super(TResNet, self).__init__()
 
         aa_layer = BlurPool2d
         act_layer = nn.LeakyReLU
@@ -145,20 +159,20 @@ class TResNet(nn.Module):
             self.inplanes = self.inplanes // 8 * 8
             self.planes = self.planes // 8 * 8
 
-        dpr = [x.tolist() for x in torch.linspace(0, drop_path_rate, sum(layers)).split(layers)]
-        conv1 = ConvNormAct(in_chans * 16, self.planes, stride=1, kernel_size=3, act_layer=act_layer)
+        dpr = calculate_drop_path_rates(drop_path_rate, layers, stagewise=True)
+        conv1 = ConvNormAct(in_chans * 16, self.planes, stride=1, kernel_size=3, act_layer=act_layer, **dd)
         layer1 = self._make_layer(
             Bottleneck if v2 else BasicBlock,
-            self.planes, layers[0], stride=1, use_se=True, aa_layer=aa_layer, drop_path_rate=dpr[0])
+            self.planes, layers[0], stride=1, use_se=True, aa_layer=aa_layer, drop_path_rate=dpr[0], **dd)
         layer2 = self._make_layer(
             Bottleneck if v2 else BasicBlock,
-            self.planes * 2, layers[1], stride=2, use_se=True, aa_layer=aa_layer, drop_path_rate=dpr[1])
+            self.planes * 2, layers[1], stride=2, use_se=True, aa_layer=aa_layer, drop_path_rate=dpr[1], **dd)
         layer3 = self._make_layer(
             Bottleneck,
-            self.planes * 4, layers[2], stride=2, use_se=True, aa_layer=aa_layer, drop_path_rate=dpr[2])
+            self.planes * 4, layers[2], stride=2, use_se=True, aa_layer=aa_layer, drop_path_rate=dpr[2], **dd)
         layer4 = self._make_layer(
             Bottleneck,
-            self.planes * 8, layers[3], stride=2, use_se=False, aa_layer=aa_layer, drop_path_rate=dpr[3])
+            self.planes * 8, layers[3], stride=2, use_se=False, aa_layer=aa_layer, drop_path_rate=dpr[3], **dd)
 
         # body
         self.body = nn.Sequential(OrderedDict([
@@ -179,8 +193,8 @@ class TResNet(nn.Module):
         ]
 
         # head
-        self.num_features = (self.planes * 8) * Bottleneck.expansion
-        self.head = ClassifierHead(self.num_features, num_classes, pool_type=global_pool, drop_rate=drop_rate)
+        self.num_features = self.head_hidden_size = (self.planes * 8) * Bottleneck.expansion
+        self.head = ClassifierHead(self.num_features, num_classes, pool_type=global_pool, drop_rate=drop_rate, **dd)
 
         # model initialization
         for m in self.modules():
@@ -196,7 +210,20 @@ class TResNet(nn.Module):
             if isinstance(m, Bottleneck):
                 nn.init.zeros_(m.conv3.bn.weight)
 
-    def _make_layer(self, block, planes, blocks, stride=1, use_se=True, aa_layer=None, drop_path_rate=0.):
+    def _make_layer(
+            self,
+            block,
+            planes,
+            blocks,
+            stride=1,
+            use_se=True,
+            aa_layer=None,
+            drop_path_rate=0.,
+            device=None,
+            dtype=None,
+    ):
+        dd = {'device': device, 'dtype': dtype}
+
         downsample = None
         if stride != 1 or self.inplanes != planes * block.expansion:
             layers = []
@@ -204,7 +231,7 @@ class TResNet(nn.Module):
                 # avg pooling before 1x1 conv
                 layers.append(nn.AvgPool2d(kernel_size=2, stride=2, ceil_mode=True, count_include_pad=False))
             layers += [ConvNormAct(
-                self.inplanes, planes * block.expansion, kernel_size=1, stride=1, apply_act=False, act_layer=None)]
+                self.inplanes, planes * block.expansion, kernel_size=1, stride=1, apply_act=False, **dd)]
             downsample = nn.Sequential(*layers)
 
         layers = []
@@ -217,6 +244,7 @@ class TResNet(nn.Module):
                 use_se=use_se,
                 aa_layer=aa_layer,
                 drop_path_rate=drop_path_rate[i] if isinstance(drop_path_rate, list) else drop_path_rate,
+                **dd,
             ))
             self.inplanes = planes * block.expansion
         return nn.Sequential(*layers)
@@ -231,11 +259,74 @@ class TResNet(nn.Module):
         self.grad_checkpointing = enable
 
     @torch.jit.ignore
-    def get_classifier(self):
+    def get_classifier(self) -> nn.Module:
         return self.head.fc
 
     def reset_classifier(self, num_classes: int, global_pool: Optional[str] = None):
+        self.num_classes = num_classes
         self.head.reset(num_classes, pool_type=global_pool)
+
+    def forward_intermediates(
+            self,
+            x: torch.Tensor,
+            indices: Optional[Union[int, List[int]]] = None,
+            norm: bool = False,
+            stop_early: bool = False,
+            output_fmt: str = 'NCHW',
+            intermediates_only: bool = False,
+    ) -> Union[List[torch.Tensor], Tuple[torch.Tensor, List[torch.Tensor]]]:
+        """ Forward features that returns intermediates.
+
+        Args:
+            x: Input image tensor
+            indices: Take last n blocks if int, all if None, select matching indices if sequence
+            norm: Apply norm layer to compatible intermediates
+            stop_early: Stop iterating over blocks when last desired intermediate hit
+            output_fmt: Shape of intermediate feature outputs
+            intermediates_only: Only return intermediate features
+        Returns:
+
+        """
+        assert output_fmt in ('NCHW',), 'Output shape must be NCHW.'
+        intermediates = []
+        stage_ends = [1, 2, 3, 4, 5]
+        take_indices, max_index = feature_take_indices(len(stage_ends), indices)
+        take_indices = [stage_ends[i] for i in take_indices]
+        max_index = stage_ends[max_index]
+        # forward pass
+        if torch.jit.is_scripting() or not stop_early:  # can't slice blocks in torchscript
+            stages = self.body
+        else:
+            stages = self.body[:max_index + 1]
+
+        for feat_idx, stage in enumerate(stages):
+            if self.grad_checkpointing and not torch.jit.is_scripting():
+                x = checkpoint(stage, x)
+            else:
+                x = stage(x)
+            if feat_idx in take_indices:
+                intermediates.append(x)
+
+        if intermediates_only:
+            return intermediates
+
+        return x, intermediates
+
+    def prune_intermediate_layers(
+            self,
+            indices: Union[int, List[int]] = 1,
+            prune_norm: bool = False,
+            prune_head: bool = True,
+    ):
+        """ Prune layers not required for specified intermediates.
+        """
+        stage_ends = [1, 2, 3, 4, 5]
+        take_indices, max_index = feature_take_indices(len(stage_ends), indices)
+        max_index = stage_ends[max_index]
+        self.body = self.body[:max_index + 1]  # truncate blocks w/ stem as idx 0
+        if prune_head:
+            self.reset_classifier(0, '')
+        return take_indices
 
     def forward_features(self, x):
         if self.grad_checkpointing and not torch.jit.is_scripting():
@@ -252,7 +343,7 @@ class TResNet(nn.Module):
         return x
 
     def forward_head(self, x, pre_logits: bool = False):
-        return x if pre_logits else self.head(x)
+        return self.head(x, pre_logits=pre_logits) if pre_logits else self.head(x)
 
     def forward(self, x):
         x = self.forward_features(x)
@@ -299,6 +390,7 @@ def _cfg(url='', **kwargs):
         'crop_pct': 0.875, 'interpolation': 'bilinear',
         'mean': (0., 0., 0.), 'std': (1., 1., 1.),
         'first_conv': 'body.conv1.conv', 'classifier': 'head.fc',
+        'license': 'apache-2.0',
         **kwargs
     }
 

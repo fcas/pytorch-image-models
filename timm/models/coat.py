@@ -1,4 +1,4 @@
-""" 
+"""
 CoaT architecture.
 
 Paper: Co-Scale Conv-Attentional Image Transformers - https://arxiv.org/abs/2104.06399
@@ -7,7 +7,7 @@ Official CoaT code at: https://github.com/mlpc-ucsd/CoaT
 
 Modified from timm/models/vision_transformer.py
 """
-from typing import List, Optional, Union, Tuple
+from typing import List, Optional, Tuple, Union, Type, Any
 
 import torch
 import torch.nn as nn
@@ -23,7 +23,14 @@ __all__ = ['CoaT']
 
 class ConvRelPosEnc(nn.Module):
     """ Convolutional relative position encoding. """
-    def __init__(self, head_chs, num_heads, window):
+    def __init__(
+            self,
+            head_chs: int,
+            num_heads: int,
+            window: Union[int, dict],
+            device=None,
+            dtype=None,
+    ):
         """
         Initialization.
             Ch: Channels per head.
@@ -35,6 +42,7 @@ class ConvRelPosEnc(nn.Module):
                     e.g. {window size 1: #attention head split 1, window size 2: #attention head split 2})
                     It will apply different window size to the attention head splits.
         """
+        dd = {'device': device, 'dtype': dtype}
         super().__init__()
 
         if isinstance(window, int):
@@ -44,8 +52,8 @@ class ConvRelPosEnc(nn.Module):
         elif isinstance(window, dict):
             self.window = window
         else:
-            raise ValueError()            
-        
+            raise ValueError()
+
         self.conv_list = nn.ModuleList()
         self.head_splits = []
         for cur_window, cur_head_split in window.items():
@@ -56,10 +64,11 @@ class ConvRelPosEnc(nn.Module):
             cur_conv = nn.Conv2d(
                 cur_head_split * head_chs,
                 cur_head_split * head_chs,
-                kernel_size=(cur_window, cur_window), 
+                kernel_size=(cur_window, cur_window),
                 padding=(padding_size, padding_size),
-                dilation=(dilation, dilation),                          
+                dilation=(dilation, dilation),
                 groups=cur_head_split * head_chs,
+                **dd,
             )
             self.conv_list.append(cur_conv)
             self.head_splits.append(cur_head_split)
@@ -91,21 +100,24 @@ class FactorAttnConvRelPosEnc(nn.Module):
     """ Factorized attention with convolutional relative position encoding class. """
     def __init__(
             self,
-            dim,
-            num_heads=8,
-            qkv_bias=False,
-            attn_drop=0.,
-            proj_drop=0.,
-            shared_crpe=None,
+            dim: int,
+            num_heads: int = 8,
+            qkv_bias: bool = False,
+            attn_drop: float = 0.,
+            proj_drop: float = 0.,
+            shared_crpe: Optional[Any] = None,
+            device=None,
+            dtype=None,
     ):
+        dd = {'device': device, 'dtype': dtype}
         super().__init__()
         self.num_heads = num_heads
         head_dim = dim // num_heads
         self.scale = head_dim ** -0.5
 
-        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias, **dd)
         self.attn_drop = nn.Dropout(attn_drop)  # Note: attn_drop is actually not used.
-        self.proj = nn.Linear(dim, dim)
+        self.proj = nn.Linear(dim, dim, **dd)
         self.proj_drop = nn.Dropout(proj_drop)
 
         # Shared convolutional relative position encoding.
@@ -138,13 +150,20 @@ class FactorAttnConvRelPosEnc(nn.Module):
 
 
 class ConvPosEnc(nn.Module):
-    """ Convolutional Position Encoding. 
+    """ Convolutional Position Encoding.
         Note: This module is similar to the conditional position encoding in CPVT.
     """
-    def __init__(self, dim, k=3):
-        super(ConvPosEnc, self).__init__()
-        self.proj = nn.Conv2d(dim, dim, k, 1, k//2, groups=dim) 
-    
+    def __init__(
+            self,
+            dim: int,
+            k: int = 3,
+            device=None,
+            dtype=None,
+    ):
+        dd = {'device': device, 'dtype': dtype}
+        super().__init__()
+        self.proj = nn.Conv2d(dim, dim, k, 1, k//2, groups=dim, **dd)
+
     def forward(self, x, size: Tuple[int, int]):
         B, N, C = x.shape
         H, W = size
@@ -152,7 +171,7 @@ class ConvPosEnc(nn.Module):
 
         # Extract CLS token and image tokens.
         cls_token, img_tokens = x[:, :1], x[:, 1:]  # [B, 1, C], [B, H*W, C]
-        
+
         # Depthwise convolution.
         feat = img_tokens.transpose(1, 2).view(B, C, H, W)
         x = self.proj(feat) + feat
@@ -169,24 +188,27 @@ class SerialBlock(nn.Module):
         Note: In this implementation, each serial block only contains a conv-attention and a FFN (MLP) module. """
     def __init__(
             self,
-            dim,
-            num_heads,
-            mlp_ratio=4.,
-            qkv_bias=False,
-            proj_drop=0.,
-            attn_drop=0.,
-            drop_path=0.,
-            act_layer=nn.GELU,
-            norm_layer=nn.LayerNorm,
-            shared_cpe=None,
-            shared_crpe=None,
+            dim: int,
+            num_heads: int,
+            mlp_ratio: float = 4.,
+            qkv_bias: bool = False,
+            proj_drop: float = 0.,
+            attn_drop: float = 0.,
+            drop_path: float = 0.,
+            act_layer: Type[nn.Module] = nn.GELU,
+            norm_layer: Type[nn.Module] = nn.LayerNorm,
+            shared_cpe: Optional[Any] = None,
+            shared_crpe: Optional[Any] = None,
+            device=None,
+            dtype=None,
     ):
+        dd = {'device': device, 'dtype': dtype}
         super().__init__()
 
         # Conv-Attention.
         self.cpe = shared_cpe
 
-        self.norm1 = norm_layer(dim)
+        self.norm1 = norm_layer(dim, **dd)
         self.factoratt_crpe = FactorAttnConvRelPosEnc(
             dim,
             num_heads=num_heads,
@@ -194,17 +216,19 @@ class SerialBlock(nn.Module):
             attn_drop=attn_drop,
             proj_drop=proj_drop,
             shared_crpe=shared_crpe,
+            **dd,
         )
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
 
         # MLP.
-        self.norm2 = norm_layer(dim)
+        self.norm2 = norm_layer(dim, **dd)
         mlp_hidden_dim = int(dim * mlp_ratio)
         self.mlp = Mlp(
             in_features=dim,
             hidden_features=mlp_hidden_dim,
             act_layer=act_layer,
             drop=proj_drop,
+            **dd,
         )
 
     def forward(self, x, size: Tuple[int, int]):
@@ -212,9 +236,9 @@ class SerialBlock(nn.Module):
         x = self.cpe(x, size)
         cur = self.norm1(x)
         cur = self.factoratt_crpe(cur, size)
-        x = x + self.drop_path(cur) 
+        x = x + self.drop_path(cur)
 
-        # MLP. 
+        # MLP.
         cur = self.norm2(x)
         cur = self.mlp(cur)
         x = x + self.drop_path(cur)
@@ -226,23 +250,28 @@ class ParallelBlock(nn.Module):
     """ Parallel block class. """
     def __init__(
             self,
-            dims,
-            num_heads,
-            mlp_ratios=[],
-            qkv_bias=False,
-            proj_drop=0.,
-            attn_drop=0.,
-            drop_path=0.,
-            act_layer=nn.GELU,
-            norm_layer=nn.LayerNorm,
-            shared_crpes=None,
+            dims: List[int],
+            num_heads: int,
+            mlp_ratios: List[float] = None,
+            qkv_bias: bool = False,
+            proj_drop: float = 0.,
+            attn_drop: float = 0.,
+            drop_path: float = 0.,
+            act_layer: Type[nn.Module] = nn.GELU,
+            norm_layer: Type[nn.Module] = nn.LayerNorm,
+            shared_crpes: Optional[List[Any]] = None,
+            device=None,
+            dtype=None,
     ):
+        dd = {'device': device, 'dtype': dtype}
         super().__init__()
+        if mlp_ratios is None:
+            mlp_ratios = []
 
         # Conv-Attention.
-        self.norm12 = norm_layer(dims[1])
-        self.norm13 = norm_layer(dims[2])
-        self.norm14 = norm_layer(dims[3])
+        self.norm12 = norm_layer(dims[1], **dd)
+        self.norm13 = norm_layer(dims[2], **dd)
+        self.norm14 = norm_layer(dims[3], **dd)
         self.factoratt_crpe2 = FactorAttnConvRelPosEnc(
             dims[1],
             num_heads=num_heads,
@@ -250,6 +279,7 @@ class ParallelBlock(nn.Module):
             attn_drop=attn_drop,
             proj_drop=proj_drop,
             shared_crpe=shared_crpes[1],
+            **dd,
         )
         self.factoratt_crpe3 = FactorAttnConvRelPosEnc(
             dims[2],
@@ -258,6 +288,7 @@ class ParallelBlock(nn.Module):
             attn_drop=attn_drop,
             proj_drop=proj_drop,
             shared_crpe=shared_crpes[2],
+            **dd,
         )
         self.factoratt_crpe4 = FactorAttnConvRelPosEnc(
             dims[3],
@@ -266,13 +297,14 @@ class ParallelBlock(nn.Module):
             attn_drop=attn_drop,
             proj_drop=proj_drop,
             shared_crpe=shared_crpes[3],
+            **dd,
         )
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
 
         # MLP.
-        self.norm22 = norm_layer(dims[1])
-        self.norm23 = norm_layer(dims[2])
-        self.norm24 = norm_layer(dims[3])
+        self.norm22 = norm_layer(dims[1], **dd)
+        self.norm23 = norm_layer(dims[2], **dd)
+        self.norm24 = norm_layer(dims[3], **dd)
         # In parallel block, we assume dimensions are the same and share the linear transformation.
         assert dims[1] == dims[2] == dims[3]
         assert mlp_ratios[1] == mlp_ratios[2] == mlp_ratios[3]
@@ -282,6 +314,7 @@ class ParallelBlock(nn.Module):
             hidden_features=mlp_hidden_dim,
             act_layer=act_layer,
             drop=proj_drop,
+            **dd,
         )
 
     def upsample(self, x, factor: float, size: Tuple[int, int]):
@@ -300,7 +333,7 @@ class ParallelBlock(nn.Module):
 
         cls_token = x[:, :1, :]
         img_tokens = x[:, 1:, :]
-        
+
         img_tokens = img_tokens.transpose(1, 2).reshape(B, C, H, W)
         img_tokens = F.interpolate(
             img_tokens,
@@ -310,7 +343,7 @@ class ParallelBlock(nn.Module):
             align_corners=False,
         )
         img_tokens = img_tokens.reshape(B, C, -1).transpose(1, 2)
-        
+
         out = torch.cat((cls_token, img_tokens), dim=1)
 
         return out
@@ -332,11 +365,11 @@ class ParallelBlock(nn.Module):
         cur2 = cur2 + upsample3_2 + upsample4_2
         cur3 = cur3 + upsample4_3 + downsample2_3
         cur4 = cur4 + downsample3_4 + downsample2_4
-        x2 = x2 + self.drop_path(cur2) 
-        x3 = x3 + self.drop_path(cur3) 
-        x4 = x4 + self.drop_path(cur4) 
+        x2 = x2 + self.drop_path(cur2)
+        x3 = x3 + self.drop_path(cur3)
+        x4 = x4 + self.drop_path(cur4)
 
-        # MLP. 
+        # MLP.
         cur2 = self.norm22(x2)
         cur3 = self.norm23(x3)
         cur4 = self.norm24(x4)
@@ -345,7 +378,7 @@ class ParallelBlock(nn.Module):
         cur4 = self.mlp4(cur4)
         x2 = x2 + self.drop_path(cur2)
         x3 = x3 + self.drop_path(cur3)
-        x4 = x4 + self.drop_path(cur4) 
+        x4 = x4 + self.drop_path(cur4)
 
         return x1, x2, x3, x4
 
@@ -354,72 +387,74 @@ class CoaT(nn.Module):
     """ CoaT class. """
     def __init__(
             self,
-            img_size=224,
-            patch_size=16,
-            in_chans=3,
-            num_classes=1000,
-            embed_dims=(64, 128, 320, 512),
-            serial_depths=(3, 4, 6, 3),
-            parallel_depth=0,
-            num_heads=8,
-            mlp_ratios=(4, 4, 4, 4),
-            qkv_bias=True,
-            drop_rate=0.,
-            proj_drop_rate=0.,
-            attn_drop_rate=0.,
-            drop_path_rate=0.,
-            norm_layer=LayerNorm,
-            return_interm_layers=False,
-            out_features=None,
-            crpe_window=None,
-            global_pool='token',
+            img_size: int = 224,
+            patch_size: int = 16,
+            in_chans: int = 3,
+            num_classes: int = 1000,
+            embed_dims: Tuple[int, int, int, int] = (64, 128, 320, 512),
+            serial_depths: Tuple[int, int, int, int] = (3, 4, 6, 3),
+            parallel_depth: int = 0,
+            num_heads: int = 8,
+            mlp_ratios: Tuple[float, float, float, float] = (4, 4, 4, 4),
+            qkv_bias: bool = True,
+            drop_rate: float = 0.,
+            proj_drop_rate: float = 0.,
+            attn_drop_rate: float = 0.,
+            drop_path_rate: float = 0.,
+            norm_layer: Type[nn.Module] = LayerNorm,
+            return_interm_layers: bool = False,
+            out_features: Optional[List[str]] = None,
+            crpe_window: Optional[dict] = None,
+            global_pool: str = 'token',
+            device=None,
+            dtype=None,
     ):
         super().__init__()
+        dd = {'device': device, 'dtype': dtype}
         assert global_pool in ('token', 'avg')
         crpe_window = crpe_window or {3: 2, 5: 3, 7: 3}
         self.return_interm_layers = return_interm_layers
         self.out_features = out_features
         self.embed_dims = embed_dims
-        self.num_features = embed_dims[-1]
+        self.num_features = self.head_hidden_size = embed_dims[-1]
         self.num_classes = num_classes
+        self.in_chans = in_chans
         self.global_pool = global_pool
 
         # Patch embeddings.
         img_size = to_2tuple(img_size)
         self.patch_embed1 = PatchEmbed(
             img_size=img_size, patch_size=patch_size, in_chans=in_chans,
-            embed_dim=embed_dims[0], norm_layer=nn.LayerNorm)
+            embed_dim=embed_dims[0], norm_layer=nn.LayerNorm, **dd)
         self.patch_embed2 = PatchEmbed(
             img_size=[x // 4 for x in img_size], patch_size=2, in_chans=embed_dims[0],
-            embed_dim=embed_dims[1], norm_layer=nn.LayerNorm)
+            embed_dim=embed_dims[1], norm_layer=nn.LayerNorm, **dd)
         self.patch_embed3 = PatchEmbed(
             img_size=[x // 8 for x in img_size], patch_size=2, in_chans=embed_dims[1],
-            embed_dim=embed_dims[2], norm_layer=nn.LayerNorm)
+            embed_dim=embed_dims[2], norm_layer=nn.LayerNorm, **dd)
         self.patch_embed4 = PatchEmbed(
             img_size=[x // 16 for x in img_size], patch_size=2, in_chans=embed_dims[2],
-            embed_dim=embed_dims[3], norm_layer=nn.LayerNorm)
+            embed_dim=embed_dims[3], norm_layer=nn.LayerNorm, **dd)
 
         # Class tokens.
-        self.cls_token1 = nn.Parameter(torch.zeros(1, 1, embed_dims[0]))
-        self.cls_token2 = nn.Parameter(torch.zeros(1, 1, embed_dims[1]))
-        self.cls_token3 = nn.Parameter(torch.zeros(1, 1, embed_dims[2]))
-        self.cls_token4 = nn.Parameter(torch.zeros(1, 1, embed_dims[3]))
+        self.cls_token1 = nn.Parameter(torch.zeros(1, 1, embed_dims[0], **dd))
+        self.cls_token2 = nn.Parameter(torch.zeros(1, 1, embed_dims[1], **dd))
+        self.cls_token3 = nn.Parameter(torch.zeros(1, 1, embed_dims[2], **dd))
+        self.cls_token4 = nn.Parameter(torch.zeros(1, 1, embed_dims[3], **dd))
 
         # Convolutional position encodings.
-        self.cpe1 = ConvPosEnc(dim=embed_dims[0], k=3)
-        self.cpe2 = ConvPosEnc(dim=embed_dims[1], k=3)
-        self.cpe3 = ConvPosEnc(dim=embed_dims[2], k=3)
-        self.cpe4 = ConvPosEnc(dim=embed_dims[3], k=3)
+        self.cpe1 = ConvPosEnc(dim=embed_dims[0], k=3, **dd)
+        self.cpe2 = ConvPosEnc(dim=embed_dims[1], k=3, **dd)
+        self.cpe3 = ConvPosEnc(dim=embed_dims[2], k=3, **dd)
+        self.cpe4 = ConvPosEnc(dim=embed_dims[3], k=3, **dd)
 
         # Convolutional relative position encodings.
-        self.crpe1 = ConvRelPosEnc(head_chs=embed_dims[0] // num_heads, num_heads=num_heads, window=crpe_window)
-        self.crpe2 = ConvRelPosEnc(head_chs=embed_dims[1] // num_heads, num_heads=num_heads, window=crpe_window)
-        self.crpe3 = ConvRelPosEnc(head_chs=embed_dims[2] // num_heads, num_heads=num_heads, window=crpe_window)
-        self.crpe4 = ConvRelPosEnc(head_chs=embed_dims[3] // num_heads, num_heads=num_heads, window=crpe_window)
+        self.crpe1 = ConvRelPosEnc(head_chs=embed_dims[0] // num_heads, num_heads=num_heads, window=crpe_window, **dd)
+        self.crpe2 = ConvRelPosEnc(head_chs=embed_dims[1] // num_heads, num_heads=num_heads, window=crpe_window, **dd)
+        self.crpe3 = ConvRelPosEnc(head_chs=embed_dims[2] // num_heads, num_heads=num_heads, window=crpe_window, **dd)
+        self.crpe4 = ConvRelPosEnc(head_chs=embed_dims[3] // num_heads, num_heads=num_heads, window=crpe_window, **dd)
 
-        # Disable stochastic depth.
         dpr = drop_path_rate
-        assert dpr == 0.0
         skwargs = dict(
             num_heads=num_heads,
             qkv_bias=qkv_bias,
@@ -437,6 +472,7 @@ class CoaT(nn.Module):
                 shared_cpe=self.cpe1,
                 shared_crpe=self.crpe1,
                 **skwargs,
+                **dd,
             )
             for _ in range(serial_depths[0])]
         )
@@ -449,6 +485,7 @@ class CoaT(nn.Module):
                 shared_cpe=self.cpe2,
                 shared_crpe=self.crpe2,
                 **skwargs,
+                **dd,
             )
             for _ in range(serial_depths[1])]
         )
@@ -461,6 +498,7 @@ class CoaT(nn.Module):
                 shared_cpe=self.cpe3,
                 shared_crpe=self.crpe3,
                 **skwargs,
+                **dd,
             )
             for _ in range(serial_depths[2])]
         )
@@ -473,6 +511,7 @@ class CoaT(nn.Module):
                 shared_cpe=self.cpe4,
                 shared_crpe=self.crpe4,
                 **skwargs,
+                **dd,
             )
             for _ in range(serial_depths[3])]
         )
@@ -486,6 +525,7 @@ class CoaT(nn.Module):
                     mlp_ratios=mlp_ratios,
                     shared_crpes=(self.crpe1, self.crpe2, self.crpe3, self.crpe4),
                     **skwargs,
+                    **dd,
                 )
                 for _ in range(parallel_depth)]
             )
@@ -495,23 +535,23 @@ class CoaT(nn.Module):
         # Classification head(s).
         if not self.return_interm_layers:
             if self.parallel_blocks is not None:
-                self.norm2 = norm_layer(embed_dims[1])
-                self.norm3 = norm_layer(embed_dims[2])
+                self.norm2 = norm_layer(embed_dims[1], **dd)
+                self.norm3 = norm_layer(embed_dims[2], **dd)
             else:
                 self.norm2 = self.norm3 = None
-            self.norm4 = norm_layer(embed_dims[3])
+            self.norm4 = norm_layer(embed_dims[3], **dd)
 
             if self.parallel_depth > 0:
                 # CoaT series: Aggregate features of last three scales for classification.
                 assert embed_dims[1] == embed_dims[2] == embed_dims[3]
-                self.aggregate = torch.nn.Conv1d(in_channels=3, out_channels=1, kernel_size=1)
+                self.aggregate = torch.nn.Conv1d(in_channels=3, out_channels=1, kernel_size=1, **dd)
                 self.head_drop = nn.Dropout(drop_rate)
-                self.head = nn.Linear(self.num_features, num_classes) if num_classes > 0 else nn.Identity()
+                self.head = nn.Linear(self.num_features, num_classes, **dd) if num_classes > 0 else nn.Identity()
             else:
                 # CoaT-Lite series: Use feature of last scale for classification.
                 self.aggregate = None
                 self.head_drop = nn.Dropout(drop_rate)
-                self.head = nn.Linear(self.num_features, num_classes) if num_classes > 0 else nn.Identity()
+                self.head = nn.Linear(self.num_features, num_classes, **dd) if num_classes > 0 else nn.Identity()
 
         # Initialize weights.
         trunc_normal_(self.cls_token1, std=.02)
@@ -556,7 +596,7 @@ class CoaT(nn.Module):
         return matcher
 
     @torch.jit.ignore
-    def get_classifier(self):
+    def get_classifier(self) -> nn.Module:
         return self.head
 
     def reset_classifier(self, num_classes: int, global_pool: Optional[str] = None):
@@ -576,7 +616,7 @@ class CoaT(nn.Module):
         for blk in self.serial_blocks1:
             x1 = blk(x1, size=(H1, W1))
         x1_nocls = remove_cls(x1).reshape(B, H1, W1, -1).permute(0, 3, 1, 2).contiguous()
-        
+
         # Serial blocks 2.
         x2 = self.patch_embed2(x1_nocls)
         H2, W2 = self.patch_embed2.grid_size
@@ -605,7 +645,7 @@ class CoaT(nn.Module):
         if self.parallel_blocks is None:
             if not torch.jit.is_scripting() and self.return_interm_layers:
                 # Return intermediate features for down-stream tasks (e.g. Deformable DETR and Detectron2).
-                feat_out = {}   
+                feat_out = {}
                 if 'x1_nocls' in self.out_features:
                     feat_out['x1_nocls'] = x1_nocls
                 if 'x2_nocls' in self.out_features:
@@ -627,7 +667,7 @@ class CoaT(nn.Module):
 
         if not torch.jit.is_scripting() and self.return_interm_layers:
             # Return intermediate features for down-stream tasks (e.g. Deformable DETR and Detectron2).
-            feat_out = {}   
+            feat_out = {}
             if 'x1_nocls' in self.out_features:
                 x1_nocls = remove_cls(x1).reshape(B, H1, W1, -1).permute(0, 3, 1, 2).contiguous()
                 feat_out['x1_nocls'] = x1_nocls
@@ -720,6 +760,7 @@ def _cfg_coat(url='', **kwargs):
         'crop_pct': .9, 'interpolation': 'bicubic', 'fixed_input_size': True,
         'mean': IMAGENET_DEFAULT_MEAN, 'std': IMAGENET_DEFAULT_STD,
         'first_conv': 'patch_embed1.proj', 'classifier': 'head',
+        'license': 'apache-2.0',
         **kwargs
     }
 

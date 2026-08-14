@@ -13,20 +13,19 @@ Modifications and additions for timm hacked together by / Copyright 2021, Ross W
 
 import math
 from functools import partial
-from typing import List, Optional, Tuple, Union
+from typing import List, Optional, Tuple, Union, Type, Any
 
 import torch
 import torch.nn as nn
-from torch.utils.checkpoint import checkpoint
 
 from timm.data import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
-from timm.layers import DropPath, trunc_normal_, to_2tuple, use_fused_attn
+from timm.layers import DropPath, trunc_normal_, to_2tuple, use_fused_attn, Mlp
 from ._builder import build_model_with_cfg
 from ._features import feature_take_indices
 from ._features_fx import register_notrace_module
+from ._manipulate import checkpoint
 from ._registry import register_model, generate_default_cfgs, register_model_deprecations
 from .cait import ClassAttn
-from .vision_transformer import Mlp
 
 __all__ = ['Xcit']  # model_registry will add each entrypoint fn to this
 
@@ -39,9 +38,17 @@ class PositionalEncodingFourier(nn.Module):
         - https://github.com/facebookresearch/xcit/blob/master/xcit.py
     """
 
-    def __init__(self, hidden_dim=32, dim=768, temperature=10000):
+    def __init__(
+            self,
+            hidden_dim: int = 32,
+            dim: int = 768,
+            temperature: float = 10000,
+            device=None,
+            dtype=None,
+    ):
+        dd = {'device': device, 'dtype': dtype}
         super().__init__()
-        self.token_projection = nn.Conv2d(hidden_dim * 2, dim, kernel_size=1)
+        self.token_projection = nn.Conv2d(hidden_dim * 2, dim, kernel_size=1, **dd)
         self.scale = 2 * math.pi
         self.temperature = temperature
         self.hidden_dim = hidden_dim
@@ -66,18 +73,29 @@ class PositionalEncodingFourier(nn.Module):
         return pos.repeat(B, 1, 1, 1)  # (B, C, H, W)
 
 
-def conv3x3(in_planes, out_planes, stride=1):
+def conv3x3(in_planes, out_planes, stride=1, device=None, dtype=None):
     """3x3 convolution + batch norm"""
+    dd = {'device': device, 'dtype': dtype}
     return torch.nn.Sequential(
-        nn.Conv2d(in_planes, out_planes, kernel_size=3, stride=stride, padding=1, bias=False),
-        nn.BatchNorm2d(out_planes)
+        nn.Conv2d(in_planes, out_planes, kernel_size=3, stride=stride, padding=1, bias=False, **dd),
+        nn.BatchNorm2d(out_planes, **dd)
     )
 
 
 class ConvPatchEmbed(nn.Module):
     """Image to Patch Embedding using multiple convolutional layers"""
 
-    def __init__(self, img_size=224, patch_size=16, in_chans=3, embed_dim=768, act_layer=nn.GELU):
+    def __init__(
+            self,
+            img_size: int = 224,
+            patch_size: int = 16,
+            in_chans: int = 3,
+            embed_dim: int = 768,
+            act_layer: Type[nn.Module] = nn.GELU,
+            device=None,
+            dtype=None,
+    ):
+        dd = {'device': device, 'dtype': dtype}
         super().__init__()
         img_size = to_2tuple(img_size)
         num_patches = (img_size[1] // patch_size) * (img_size[0] // patch_size)
@@ -87,21 +105,21 @@ class ConvPatchEmbed(nn.Module):
 
         if patch_size == 16:
             self.proj = torch.nn.Sequential(
-                conv3x3(in_chans, embed_dim // 8, 2),
+                conv3x3(in_chans, embed_dim // 8, 2, **dd),
                 act_layer(),
-                conv3x3(embed_dim // 8, embed_dim // 4, 2),
+                conv3x3(embed_dim // 8, embed_dim // 4, 2, **dd),
                 act_layer(),
-                conv3x3(embed_dim // 4, embed_dim // 2, 2),
+                conv3x3(embed_dim // 4, embed_dim // 2, 2, **dd),
                 act_layer(),
-                conv3x3(embed_dim // 2, embed_dim, 2),
+                conv3x3(embed_dim // 2, embed_dim, 2, **dd),
             )
         elif patch_size == 8:
             self.proj = torch.nn.Sequential(
-                conv3x3(in_chans, embed_dim // 4, 2),
+                conv3x3(in_chans, embed_dim // 4, 2, **dd),
                 act_layer(),
-                conv3x3(embed_dim // 4, embed_dim // 2, 2),
+                conv3x3(embed_dim // 4, embed_dim // 2, 2, **dd),
                 act_layer(),
-                conv3x3(embed_dim // 2, embed_dim, 2),
+                conv3x3(embed_dim // 2, embed_dim, 2, **dd),
             )
         else:
             raise('For convolutional projection, patch size has to be in [8, 16]')
@@ -120,18 +138,26 @@ class LPI(nn.Module):
     3x3 convolutions with GeLU and BatchNorm2d
     """
 
-    def __init__(self, in_features, out_features=None, act_layer=nn.GELU, kernel_size=3):
+    def __init__(
+            self,
+            in_features: int,
+            out_features: Optional[int] = None,
+            act_layer: Type[nn.Module] = nn.GELU,
+            kernel_size: int = 3,
+            device=None,
+            dtype=None,
+    ):
         super().__init__()
+        dd = {'device': device, 'dtype': dtype}
         out_features = out_features or in_features
-
         padding = kernel_size // 2
 
         self.conv1 = torch.nn.Conv2d(
-            in_features, in_features, kernel_size=kernel_size, padding=padding, groups=in_features)
+            in_features, in_features, kernel_size=kernel_size, padding=padding, groups=in_features, **dd)
         self.act = act_layer()
-        self.bn = nn.BatchNorm2d(in_features)
+        self.bn = nn.BatchNorm2d(in_features, **dd)
         self.conv2 = torch.nn.Conv2d(
-            in_features, out_features, kernel_size=kernel_size, padding=padding, groups=out_features)
+            in_features, out_features, kernel_size=kernel_size, padding=padding, groups=out_features, **dd)
 
     def forward(self, x, H: int, W: int):
         B, N, C = x.shape
@@ -149,31 +175,46 @@ class ClassAttentionBlock(nn.Module):
 
     def __init__(
             self,
-            dim,
-            num_heads,
-            mlp_ratio=4.,
-            qkv_bias=False,
-            proj_drop=0.,
-            attn_drop=0.,
-            drop_path=0.,
-            act_layer=nn.GELU,
-            norm_layer=nn.LayerNorm,
-            eta=1.,
-            tokens_norm=False,
+            dim: int,
+            num_heads: int,
+            mlp_ratio: float = 4.,
+            qkv_bias: bool = False,
+            proj_drop: float = 0.,
+            attn_drop: float = 0.,
+            drop_path: float = 0.,
+            act_layer: Type[nn.Module] = nn.GELU,
+            norm_layer: Type[nn.Module] = nn.LayerNorm,
+            eta: Optional[float] = 1.,
+            tokens_norm: bool = False,
+            device=None,
+            dtype=None,
     ):
+        dd = {'device': device, 'dtype': dtype}
         super().__init__()
-        self.norm1 = norm_layer(dim)
-
+        self.norm1 = norm_layer(dim, **dd)
         self.attn = ClassAttn(
-            dim, num_heads=num_heads, qkv_bias=qkv_bias, attn_drop=attn_drop, proj_drop=proj_drop)
+            dim,
+            num_heads=num_heads,
+            qkv_bias=qkv_bias,
+            attn_drop=attn_drop,
+            proj_drop=proj_drop,
+            **dd,
+        )
+        self.drop_path1 = DropPath(drop_path) if drop_path > 0. else nn.Identity()
 
-        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
-        self.norm2 = norm_layer(dim)
-        self.mlp = Mlp(in_features=dim, hidden_features=int(dim * mlp_ratio), act_layer=act_layer, drop=proj_drop)
+        self.norm2 = norm_layer(dim, **dd)
+        self.mlp = Mlp(
+            in_features=dim,
+            hidden_features=int(dim * mlp_ratio),
+            act_layer=act_layer,
+            drop=proj_drop,
+            **dd,
+        )
+        self.drop_path2 = DropPath(drop_path) if drop_path > 0. else nn.Identity()
 
         if eta is not None:  # LayerScale Initialization (no layerscale when None)
-            self.gamma1 = nn.Parameter(eta * torch.ones(dim))
-            self.gamma2 = nn.Parameter(eta * torch.ones(dim))
+            self.gamma1 = nn.Parameter(eta * torch.ones(dim, **dd))
+            self.gamma2 = nn.Parameter(eta * torch.ones(dim, **dd))
         else:
             self.gamma1, self.gamma2 = 1.0, 1.0
 
@@ -183,7 +224,8 @@ class ClassAttentionBlock(nn.Module):
     def forward(self, x):
         x_norm1 = self.norm1(x)
         x_attn = torch.cat([self.attn(x_norm1), x_norm1[:, 1:]], dim=1)
-        x = x + self.drop_path(self.gamma1 * x_attn)
+        x = x + self.drop_path1(self.gamma1 * x_attn)
+
         if self.tokens_norm:
             x = self.norm2(x)
         else:
@@ -192,7 +234,7 @@ class ClassAttentionBlock(nn.Module):
         cls_token = x[:, 0:1]
         cls_token = self.gamma2 * self.mlp(cls_token)
         x = torch.cat([cls_token, x[:, 1:]], dim=1)
-        x = x_res + self.drop_path(x)
+        x = x_res + self.drop_path2(x)
         return x
 
 
@@ -203,14 +245,24 @@ class XCA(nn.Module):
     normalized) Cross-covariance matrix (Q^T \\cdot K \\in d_h \\times d_h)
     """
 
-    def __init__(self, dim, num_heads=8, qkv_bias=False, attn_drop=0., proj_drop=0.):
+    def __init__(
+            self,
+            dim: int,
+            num_heads: int = 8,
+            qkv_bias: bool = False,
+            attn_drop: float = 0.,
+            proj_drop: float = 0.,
+            device=None,
+            dtype=None,
+    ):
+        dd = {'device': device, 'dtype': dtype}
         super().__init__()
         self.num_heads = num_heads
         self.fused_attn = use_fused_attn(experimental=True)
-        self.temperature = nn.Parameter(torch.ones(num_heads, 1, 1))
-        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        self.temperature = nn.Parameter(torch.ones(num_heads, 1, 1, **dd))
+        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias, **dd)
         self.attn_drop = nn.Dropout(attn_drop)
-        self.proj = nn.Linear(dim, dim)
+        self.proj = nn.Linear(dim, dim, **dd)
         self.proj_drop = nn.Dropout(proj_drop)
 
     def forward(self, x):
@@ -245,38 +297,56 @@ class XCA(nn.Module):
 class XCABlock(nn.Module):
     def __init__(
             self,
-            dim,
-            num_heads,
-            mlp_ratio=4.,
-            qkv_bias=False,
-            proj_drop=0.,
-            attn_drop=0.,
-            drop_path=0.,
-            act_layer=nn.GELU,
-            norm_layer=nn.LayerNorm,
-            eta=1.,
+            dim: int,
+            num_heads: int,
+            mlp_ratio: float = 4.,
+            qkv_bias: bool = False,
+            proj_drop: float = 0.,
+            attn_drop: float = 0.,
+            drop_path: float = 0.,
+            act_layer: Type[nn.Module] = nn.GELU,
+            norm_layer: Type[nn.Module] = nn.LayerNorm,
+            eta: float = 1.,
+            device=None,
+            dtype=None,
     ):
+        dd = {'device': device, 'dtype': dtype}
         super().__init__()
-        self.norm1 = norm_layer(dim)
-        self.attn = XCA(dim, num_heads=num_heads, qkv_bias=qkv_bias, attn_drop=attn_drop, proj_drop=proj_drop)
-        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+        self.norm1 = norm_layer(dim, **dd)
+        self.attn = XCA(
+            dim,
+            num_heads=num_heads,
+            qkv_bias=qkv_bias,
+            attn_drop=attn_drop,
+            proj_drop=proj_drop,
+            **dd,
+        )
+        self.drop_path1 = DropPath(drop_path) if drop_path > 0. else nn.Identity()
 
-        self.norm3 = norm_layer(dim)
-        self.local_mp = LPI(in_features=dim, act_layer=act_layer)
+        self.norm3 = norm_layer(dim, **dd)
+        self.local_mp = LPI(in_features=dim, act_layer=act_layer, **dd)
+        self.drop_path3 = DropPath(drop_path) if drop_path > 0. else nn.Identity()
 
-        self.norm2 = norm_layer(dim)
-        self.mlp = Mlp(in_features=dim, hidden_features=int(dim * mlp_ratio), act_layer=act_layer, drop=proj_drop)
+        self.norm2 = norm_layer(dim, **dd)
+        self.mlp = Mlp(
+            in_features=dim,
+            hidden_features=int(dim * mlp_ratio),
+            act_layer=act_layer,
+            drop=proj_drop,
+            **dd,
+        )
+        self.drop_path2 = DropPath(drop_path) if drop_path > 0. else nn.Identity()
 
-        self.gamma1 = nn.Parameter(eta * torch.ones(dim))
-        self.gamma3 = nn.Parameter(eta * torch.ones(dim))
-        self.gamma2 = nn.Parameter(eta * torch.ones(dim))
+        self.gamma1 = nn.Parameter(eta * torch.ones(dim, **dd))
+        self.gamma3 = nn.Parameter(eta * torch.ones(dim, **dd))
+        self.gamma2 = nn.Parameter(eta * torch.ones(dim, **dd))
 
     def forward(self, x, H: int, W: int):
-        x = x + self.drop_path(self.gamma1 * self.attn(self.norm1(x)))
+        x = x + self.drop_path1(self.gamma1 * self.attn(self.norm1(x)))
         # NOTE official code has 3 then 2, so keeping it the same to be consistent with loaded weights
         # See https://github.com/rwightman/pytorch-image-models/pull/747#issuecomment-877795721
-        x = x + self.drop_path(self.gamma3 * self.local_mp(self.norm3(x), H, W))
-        x = x + self.drop_path(self.gamma2 * self.mlp(self.norm2(x)))
+        x = x + self.drop_path3(self.gamma3 * self.local_mp(self.norm3(x), H, W))
+        x = x + self.drop_path2(self.gamma2 * self.mlp(self.norm2(x)))
         return x
 
 
@@ -289,27 +359,29 @@ class Xcit(nn.Module):
 
     def __init__(
             self,
-            img_size=224,
-            patch_size=16,
-            in_chans=3,
-            num_classes=1000,
-            global_pool='token',
-            embed_dim=768,
-            depth=12,
-            num_heads=12,
-            mlp_ratio=4.,
-            qkv_bias=True,
-            drop_rate=0.,
-            pos_drop_rate=0.,
-            proj_drop_rate=0.,
-            attn_drop_rate=0.,
-            drop_path_rate=0.,
-            act_layer=None,
-            norm_layer=None,
-            cls_attn_layers=2,
-            use_pos_embed=True,
-            eta=1.,
-            tokens_norm=False,
+            img_size: Union[int, Tuple[int, int]] = 224,
+            patch_size: int = 16,
+            in_chans: int = 3,
+            num_classes: int = 1000,
+            global_pool: str = 'token',
+            embed_dim: int = 768,
+            depth: int = 12,
+            num_heads: int = 12,
+            mlp_ratio: float = 4.,
+            qkv_bias: bool = True,
+            drop_rate: float = 0.,
+            pos_drop_rate: float = 0.,
+            proj_drop_rate: float = 0.,
+            attn_drop_rate: float = 0.,
+            drop_path_rate: float = 0.,
+            act_layer: Optional[Type[nn.Module]] = None,
+            norm_layer: Optional[Type[nn.Module]] = None,
+            cls_attn_layers: int = 2,
+            use_pos_embed: bool = True,
+            eta: float = 1.,
+            tokens_norm: bool = False,
+            device=None,
+            dtype=None,
     ):
         """
         Args:
@@ -338,6 +410,7 @@ class Xcit(nn.Module):
               interaction (class LPI) and the patch embedding (class ConvPatchEmbed)
         """
         super().__init__()
+        dd = {'device': device, 'dtype': dtype}
         assert global_pool in ('', 'avg', 'token')
         img_size = to_2tuple(img_size)
         assert (img_size[0] % patch_size == 0) and (img_size[0] % patch_size == 0), \
@@ -346,7 +419,8 @@ class Xcit(nn.Module):
         act_layer = act_layer or nn.GELU
 
         self.num_classes = num_classes
-        self.num_features = self.embed_dim = embed_dim
+        self.in_chans = in_chans
+        self.num_features = self.head_hidden_size = self.embed_dim = embed_dim
         self.global_pool = global_pool
         self.grad_checkpointing = False
 
@@ -356,12 +430,13 @@ class Xcit(nn.Module):
             in_chans=in_chans,
             embed_dim=embed_dim,
             act_layer=act_layer,
+            **dd,
         )
         r = patch_size
 
-        self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim, **dd))
         if use_pos_embed:
-            self.pos_embed = PositionalEncodingFourier(dim=embed_dim)
+            self.pos_embed = PositionalEncodingFourier(dim=embed_dim, **dd)
         else:
             self.pos_embed = None
         self.pos_drop = nn.Dropout(p=pos_drop_rate)
@@ -378,6 +453,7 @@ class Xcit(nn.Module):
                 act_layer=act_layer,
                 norm_layer=norm_layer,
                 eta=eta,
+                **dd,
             )
             for _ in range(depth)])
         self.feature_info = [dict(num_chs=embed_dim, reduction=r, module=f'blocks.{i}') for i in range(depth)]
@@ -394,13 +470,14 @@ class Xcit(nn.Module):
                 norm_layer=norm_layer,
                 eta=eta,
                 tokens_norm=tokens_norm,
+                **dd,
             )
             for _ in range(cls_attn_layers)])
 
         # Classifier head
-        self.norm = norm_layer(embed_dim)
+        self.norm = norm_layer(embed_dim, **dd)
         self.head_drop = nn.Dropout(drop_rate)
-        self.head = nn.Linear(self.num_features, num_classes) if num_classes > 0 else nn.Identity()
+        self.head = nn.Linear(self.num_features, num_classes, **dd) if num_classes > 0 else nn.Identity()
 
         # Init weights
         trunc_normal_(self.cls_token, std=.02)
@@ -429,20 +506,22 @@ class Xcit(nn.Module):
         self.grad_checkpointing = enable
 
     @torch.jit.ignore
-    def get_classifier(self):
+    def get_classifier(self) -> nn.Module:
         return self.head
 
-    def reset_classifier(self, num_classes, global_pool=''):
+    def reset_classifier(self, num_classes: int, global_pool: Optional[str] = None):
         self.num_classes = num_classes
         if global_pool is not None:
             assert global_pool in ('', 'avg', 'token')
             self.global_pool = global_pool
-        self.head = nn.Linear(self.num_features, num_classes) if num_classes > 0 else nn.Identity()
+        device = self.head.weight.device if hasattr(self.head, 'weight') else None
+        dtype = self.head.weight.dtype if hasattr(self.head, 'weight') else None
+        self.head = nn.Linear(self.num_features, num_classes, device=device, dtype=dtype) if num_classes > 0 else nn.Identity()
 
     def forward_intermediates(
             self,
             x: torch.Tensor,
-            indices: Optional[Union[int, List[int], Tuple[int]]] = None,
+            indices: Optional[Union[int, List[int]]] = None,
             norm: bool = False,
             stop_early: bool = False,
             output_fmt: str = 'NCHW',
@@ -479,7 +558,10 @@ class Xcit(nn.Module):
         else:
             blocks = self.blocks[:max_index + 1]
         for i, blk in enumerate(blocks):
-            x = blk(x, Hp, Wp)
+            if self.grad_checkpointing and not torch.jit.is_scripting():
+                x = checkpoint(blk, x, Hp, Wp)
+            else:
+                x = blk(x, Hp, Wp)
             if i in take_indices:
                 # normalize intermediates with final norm layer if enabled
                 intermediates.append(self.norm(x) if norm else x)
@@ -495,14 +577,18 @@ class Xcit(nn.Module):
         # NOTE not supporting return of class tokens
         x = torch.cat((self.cls_token.expand(B, -1, -1), x), dim=1)
         for blk in self.cls_attn_blocks:
+            if self.grad_checkpointing and not torch.jit.is_scripting():
+                x = checkpoint(blk, x)
+            else:
                 x = blk(x)
+
         x = self.norm(x)
 
         return x, intermediates
 
     def prune_intermediate_layers(
             self,
-            indices: Union[int, List[int], Tuple[int]] = 1,
+            indices: Union[int, List[int]] = 1,
             prune_norm: bool = False,
             prune_head: bool = True,
     ):
@@ -606,7 +692,7 @@ def _cfg(url='', **kwargs):
         'crop_pct': 1.0, 'interpolation': 'bicubic', 'fixed_input_size': True,
         'mean': IMAGENET_DEFAULT_MEAN, 'std': IMAGENET_DEFAULT_STD,
         'first_conv': 'patch_embed.proj.0.0', 'classifier': 'head',
-        **kwargs
+        'license': 'apache-2.0', **kwargs
     }
 
 

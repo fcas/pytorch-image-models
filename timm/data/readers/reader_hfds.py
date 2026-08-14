@@ -35,9 +35,11 @@ class ReaderHfds(Reader):
             root: Optional[str] = None,
             split: str = 'train',
             class_map: dict = None,
-            image_key: str = 'image',
+            input_key: str = 'image',
             target_key: str = 'label',
+            additional_features: Optional[list[str]] = None,
             download: bool = False,
+            trust_remote_code: bool = False
     ):
         """
         """
@@ -47,12 +49,13 @@ class ReaderHfds(Reader):
         self.dataset = datasets.load_dataset(
             name,  # 'name' maps to path arg in hf datasets
             split=split,
-            cache_dir=self.root,  # timm doesn't expect hidden cache dir for datasets, specify a path
+            cache_dir=self.root,  # timm doesn't expect hidden cache dir for datasets, specify a path if root set
+            trust_remote_code=trust_remote_code
         )
         # leave decode for caller, plus we want easy access to original path names...
-        self.dataset = self.dataset.cast_column(image_key, datasets.Image(decode=False))
+        self.dataset = self.dataset.cast_column(input_key, datasets.Image(decode=False))
 
-        self.image_key = image_key
+        self.image_key = input_key
         self.label_key = target_key
         self.remap_class = False
         if class_map:
@@ -63,18 +66,33 @@ class ReaderHfds(Reader):
         self.split_info = self.dataset.info.splits[split]
         self.num_samples = self.split_info.num_examples
 
+        if additional_features is not None:
+            if isinstance(additional_features, list):
+                self.additional_features = additional_features
+            else:
+                self.additional_features = [additional_features]
+        else:
+            self.additional_features = None
+
     def __getitem__(self, index):
         item = self.dataset[index]
         image = item[self.image_key]
+
         if 'bytes' in image and image['bytes']:
             image = io.BytesIO(image['bytes'])
         else:
             assert 'path' in image and image['path']
             image = open(image['path'], 'rb')
+
         label = item[self.label_key]
         if self.remap_class:
             label = self.class_to_idx[label]
-        return image, label
+
+        if self.additional_features is not None:
+            features = [item[feat] for feat in self.additional_features]
+            return image, label, *features
+        else:
+            return image, label
 
     def __len__(self):
         return len(self.dataset)

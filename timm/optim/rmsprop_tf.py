@@ -4,11 +4,18 @@ Originally cut & paste from PyTorch RMSProp
 https://github.com/pytorch/pytorch/blob/063946d2b3f3f1e953a2a3b54e0b34f1393de295/torch/optim/rmsprop.py
 Licensed under BSD-Clause 3 (ish), https://github.com/pytorch/pytorch/blob/master/LICENSE
 
+References for added functionality:
+    Cautious Optimizers: https://arxiv.org/abs/2411.16085
+    Why Gradients Rapidly Increase Near the End of Training: https://arxiv.org/abs/2506.02285
+
 Modifications Copyright 2021 Ross Wightman
 """
 
 import torch
 from torch.optim import Optimizer
+
+from ._helpers import _add_scaled_, _addcdiv_scaled_, _init_scalar, _validate_scalar
+from ._types import ParamsT
 
 
 class RMSpropTF(Optimizer):
@@ -28,39 +35,53 @@ class RMSpropTF(Optimizer):
     The centered version first appears in `Generating Sequences
     With Recurrent Neural Networks <https://arxiv.org/pdf/1308.0850v5.pdf>`_.
 
-    Arguments:
-        params (iterable): iterable of parameters to optimize or dicts defining
-            parameter groups
-        lr (float, optional): learning rate (default: 1e-2)
-        momentum (float, optional): momentum factor (default: 0)
-        alpha (float, optional): smoothing (decay) constant (default: 0.9)
-        eps (float, optional): term added to the denominator to improve
-            numerical stability (default: 1e-10)
-        centered (bool, optional) : if ``True``, compute the centered RMSProp,
-            the gradient is normalized by an estimation of its variance
-        weight_decay (float, optional): weight decay (L2 penalty) (default: 0)
-        decoupled_decay (bool, optional): decoupled weight decay as per https://arxiv.org/abs/1711.05101
-        lr_in_momentum (bool, optional): learning rate scaling is included in the momentum buffer
-            update as per defaults in Tensorflow
-
+    Args:
+        params: iterable of parameters to optimize or dicts defining parameter groups
+        lr: learning rate
+        momentum: momentum factor
+        alpha: smoothing (decay) constant
+        eps: term added to the denominator to improve numerical stability
+        centered: if ``True``, compute the centered RMSProp, the gradient is normalized by an estimation of its variance
+        weight_decay: weight decay (L2 penalty) (default: 0)
+        decoupled_decay: decoupled weight decay as per https://arxiv.org/abs/1711.05101
+        corrected_weight_decay: apply corrected weight decay (lr**2 / max_lr) when decoupled_decay is True
+        lr_in_momentum: learning rate scaling is included in the momentum buffer update as per defaults in Tensorflow
+        caution: apply caution
     """
 
-    def __init__(self, params, lr=1e-2, alpha=0.9, eps=1e-10, weight_decay=0, momentum=0., centered=False,
-                 decoupled_decay=False, lr_in_momentum=True):
-        if not 0.0 <= lr:
-            raise ValueError("Invalid learning rate: {}".format(lr))
-        if not 0.0 <= eps:
-            raise ValueError("Invalid epsilon value: {}".format(eps))
-        if not 0.0 <= momentum:
-            raise ValueError("Invalid momentum value: {}".format(momentum))
-        if not 0.0 <= weight_decay:
-            raise ValueError("Invalid weight_decay value: {}".format(weight_decay))
+    def __init__(
+            self,
+            params: ParamsT,
+            lr: float = 1e-2,
+            alpha: float = 0.9,
+            eps: float = 1e-10,
+            weight_decay: float = 0,
+            momentum: float = 0.,
+            centered: bool = False,
+            decoupled_decay: bool = False,
+            corrected_weight_decay: bool = False,
+            lr_in_momentum: bool = True,
+            caution: bool = False,
+    ):
+        _validate_scalar("learning rate", lr)
+        _validate_scalar("epsilon", eps)
+        _validate_scalar("momentum", momentum)
+        _validate_scalar("weight_decay", weight_decay)
         if not 0.0 <= alpha:
             raise ValueError("Invalid alpha value: {}".format(alpha))
 
         defaults = dict(
-            lr=lr, momentum=momentum, alpha=alpha, eps=eps, centered=centered, weight_decay=weight_decay,
-            decoupled_decay=decoupled_decay, lr_in_momentum=lr_in_momentum)
+            lr=lr,
+            momentum=momentum,
+            alpha=alpha,
+            eps=eps,
+            centered=centered,
+            weight_decay=weight_decay,
+            decoupled_decay=decoupled_decay,
+            corrected_weight_decay=corrected_weight_decay,
+            lr_in_momentum=lr_in_momentum,
+            caution=caution,
+        )
         super(RMSpropTF, self).__init__(params, defaults)
 
     def __setstate__(self, state):
@@ -68,6 +89,12 @@ class RMSpropTF(Optimizer):
         for group in self.param_groups:
             group.setdefault('momentum', 0)
             group.setdefault('centered', False)
+            group.setdefault('caution', False)
+            group.setdefault('corrected_weight_decay', False)
+            for p in group['params']:
+                p_state = self.state.get(p, {})
+                if p_state and 'step' in p_state:
+                    p_state['step'] = _init_scalar(p_state['step'], device='cpu')
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -93,7 +120,7 @@ class RMSpropTF(Optimizer):
 
                 # State initialization
                 if len(state) == 0:
-                    state['step'] = 0
+                    state['step'] = _init_scalar(device='cpu')
                     state['square_avg'] = torch.ones_like(p)  # PyTorch inits to zero
                     if group['momentum'] > 0:
                         state['momentum_buffer'] = torch.zeros_like(p)
@@ -103,11 +130,15 @@ class RMSpropTF(Optimizer):
                 square_avg = state['square_avg']
                 one_minus_alpha = 1. - group['alpha']
 
-                state['step'] += 1
+                state['step'].add_(1)
 
                 if group['weight_decay'] != 0:
                     if group['decoupled_decay']:
-                        p.mul_(1. - group['lr'] * group['weight_decay'])
+                        if group['corrected_weight_decay']:
+                            wd_scale = group['lr'] ** 2 / self.defaults['lr']
+                        else:
+                            wd_scale = group['lr']
+                        p.mul_(1. - wd_scale * group['weight_decay'])
                     else:
                         grad = grad.add(p, alpha=group['weight_decay'])
 
@@ -125,15 +156,27 @@ class RMSpropTF(Optimizer):
 
                 if group['momentum'] > 0:
                     buf = state['momentum_buffer']
-                    # Tensorflow accumulates the LR scaling in the momentum buffer
+                    buf.mul_(group['momentum'])
+
+                    def _apply_caution(_m, _g):
+                        # Apply caution as per 'Cautious Optimizers' - https://arxiv.org/abs/2411.16085
+                        mask = (_m * _g > 0).to(_g.dtype)
+                        mask.div_(mask.mean().clamp_(min=1e-3))
+                        return _m * mask
+
                     if group['lr_in_momentum']:
-                        buf.mul_(group['momentum']).addcdiv_(grad, avg, value=group['lr'])
+                        # Tensorflow accumulates the LR scaling in the momentum buffer
+                        _addcdiv_scaled_(buf, grad, avg, group['lr'])
+                        if group['caution']:
+                            buf = _apply_caution(buf, grad)
                         p.add_(-buf)
                     else:
                         # PyTorch scales the param update by LR
-                        buf.mul_(group['momentum']).addcdiv_(grad, avg)
-                        p.add_(buf, alpha=-group['lr'])
+                        buf.addcdiv_(grad, avg)
+                        if group['caution']:
+                            buf = _apply_caution(buf, grad)
+                        _add_scaled_(p, buf, -group['lr'])
                 else:
-                    p.addcdiv_(grad, avg, value=-group['lr'])
+                    _addcdiv_scaled_(p, grad, avg, -group['lr'])
 
         return loss

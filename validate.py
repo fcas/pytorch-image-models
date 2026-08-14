@@ -22,24 +22,13 @@ import torch
 import torch.nn as nn
 import torch.nn.parallel
 
+from timm import utils
 from timm.data import create_dataset, create_loader, resolve_data_config, RealLabelsImagenet
 from timm.layers import apply_test_time_pool, set_fast_norm
 from timm.models import create_model, load_checkpoint, is_model, list_models
 from timm.utils import accuracy, AverageMeter, natural_key, setup_default_logging, set_jit_fuser, \
     decay_batch_step, check_batch_size_retry, ParseKwargs, reparameterize_model
 
-try:
-    from apex import amp
-    has_apex = True
-except ImportError:
-    has_apex = False
-
-has_native_amp = False
-try:
-    if getattr(torch.cuda.amp, 'autocast') is not None:
-        has_native_amp = True
-except AttributeError:
-    pass
 
 try:
     from functorch.compile import memory_efficient_fusion
@@ -48,6 +37,12 @@ except ImportError as e:
     has_functorch = False
 
 has_compile = hasattr(torch, 'compile')
+
+try:
+    from sklearn.metrics import precision_score, recall_score, f1_score
+    has_sklearn = True
+except ImportError:
+    has_sklearn = False
 
 _logger = logging.getLogger('validate')
 
@@ -73,6 +68,8 @@ parser.add_argument('--input-img-mode', default=None, type=str,
                    help='Dataset image conversion mode for input images.')
 parser.add_argument('--target-key', default=None, type=str,
                    help='Dataset key for target labels.')
+parser.add_argument('--dataset-trust-remote-code', action='store_true', default=False,
+                   help='Allow huggingface dataset import to execute code downloaded from the dataset\'s repo.')
 
 parser.add_argument('--model', '-m', metavar='NAME', default='dpn92',
                     help='model architecture (default: dpn92)')
@@ -86,8 +83,8 @@ parser.add_argument('--img-size', default=None, type=int,
                     metavar='N', help='Input image dimension, uses model default if empty')
 parser.add_argument('--in-chans', type=int, default=None, metavar='N',
                     help='Image input channels (default: None => 3)')
-parser.add_argument('--input-size', default=None, nargs=3, type=int,
-                    metavar='N N N', help='Input all image dimensions (d h w, e.g. --input-size 3 224 224), uses model default if empty')
+parser.add_argument('--input-size', default=None, nargs=3, type=int, metavar='N',
+                    help='Input all image dimensions (d h w, e.g. --input-size 3 224 224), uses model default if empty')
 parser.add_argument('--use-train-size', action='store_true', default=False,
                     help='force use of train input size, even when test size is specified in pretrained cfg')
 parser.add_argument('--crop-pct', default=None, type=float,
@@ -123,11 +120,11 @@ parser.add_argument('--channels-last', action='store_true', default=False,
 parser.add_argument('--device', default='cuda', type=str,
                     help="Device (accelerator) to use.")
 parser.add_argument('--amp', action='store_true', default=False,
-                    help='use NVIDIA Apex AMP or Native AMP for mixed precision training')
+                    help='use Native AMP for mixed precision inference')
 parser.add_argument('--amp-dtype', default='float16', type=str,
                     help='lower precision AMP dtype (default: float16)')
-parser.add_argument('--amp-impl', default='native', type=str,
-                    help='AMP impl to use, "native" or "apex" (default: native)')
+parser.add_argument('--model-dtype', default=None, type=str,
+                   help='Model dtype override (non-AMP) (default: float32)')
 parser.add_argument('--tf-preprocessing', action='store_true', default=False,
                     help='Use Tensorflow preprocessing pipeline (require CPU TF installed')
 parser.add_argument('--use-ema', dest='use_ema', action='store_true',
@@ -139,7 +136,8 @@ parser.add_argument('--fast-norm', default=False, action='store_true',
 parser.add_argument('--reparam', default=False, action='store_true',
                     help='Reparameterize model')
 parser.add_argument('--model-kwargs', nargs='*', default={}, action=ParseKwargs)
-
+parser.add_argument('--torchcompile-mode', type=str, default=None,
+                    help="torch.compile mode (default: None).")
 
 scripting_group = parser.add_mutually_exclusive_group()
 scripting_group.add_argument('--torchscript', default=False, action='store_true',
@@ -159,6 +157,19 @@ parser.add_argument('--valid-labels', default='', type=str, metavar='FILENAME',
                     help='Valid label indices txt file for validation of partial label space')
 parser.add_argument('--retry', default=False, action='store_true',
                     help='Enable batch size decay & retry for single model validation')
+parser.add_argument('--seed', type=int, default=42, metavar='S',
+                    help='random seed (default: 42)')
+
+parser.add_argument('--metrics-avg', type=str, default=None,
+                    choices=['micro', 'macro', 'weighted'],
+                    help='Enable precision, recall, F1-score calculation and specify the averaging method. '
+                         'Requires scikit-learn. (default: None)')
+
+# NaFlex loader arguments
+parser.add_argument('--naflex-loader', action='store_true', default=False,
+                   help='Use NaFlex loader (Requires NaFlex compatible model)')
+parser.add_argument('--naflex-max-seq-len', type=int, default=576,
+                   help='Fixed maximum sequence length for NaFlex loader (validation)')
 
 
 def validate(args):
@@ -172,24 +183,28 @@ def validate(args):
 
     device = torch.device(args.device)
 
-    # resolve AMP arguments based on PyTorch / Apex availability
-    use_amp = None
+    if args.metrics_avg and not has_sklearn:
+        _logger.warning(
+            f"scikit-learn not installed, disabling metrics calculation. Please install with 'pip install scikit-learn'.")
+        args.metrics_avg = None
+
+    model_dtype = None
+    if args.model_dtype:
+        assert args.model_dtype in ('float32', 'float16', 'bfloat16')
+        model_dtype = getattr(torch, args.model_dtype)
+
+    # resolve AMP arguments based on PyTorch availability
     amp_autocast = suppress
     if args.amp:
-        if args.amp_impl == 'apex':
-            assert has_apex, 'AMP impl specified as APEX but APEX is not installed.'
-            assert args.amp_dtype == 'float16'
-            use_amp = 'apex'
-            _logger.info('Validating in mixed precision with NVIDIA APEX AMP.')
-        else:
-            assert has_native_amp, 'Please update PyTorch to a version with native AMP (or use APEX).'
-            assert args.amp_dtype in ('float16', 'bfloat16')
-            use_amp = 'native'
-            amp_dtype = torch.bfloat16 if args.amp_dtype == 'bfloat16' else torch.float16
-            amp_autocast = partial(torch.autocast, device_type=device.type, dtype=amp_dtype)
-            _logger.info('Validating in mixed precision with native PyTorch AMP.')
+        assert model_dtype is None or model_dtype == torch.float32, 'float32 model dtype must be used with AMP'
+        assert args.amp_dtype in ('float16', 'bfloat16')
+        amp_dtype = torch.bfloat16 if args.amp_dtype == 'bfloat16' else torch.float16
+        amp_autocast = partial(torch.autocast, device_type=device.type, dtype=amp_dtype)
+        _logger.info('Validating in mixed precision with native PyTorch AMP.')
     else:
-        _logger.info('Validating in float32. AMP not enabled.')
+        _logger.info(f'Validating in {model_dtype or torch.float32}. AMP not enabled.')
+
+    utils.random_seed(args.seed)
 
     if args.fuser:
         set_jit_fuser(args.fuser)
@@ -236,23 +251,19 @@ def validate(args):
     if args.test_pool:
         model, test_time_pool = apply_test_time_pool(model, data_config)
 
-    model = model.to(device)
+    model = model.to(device=device, dtype=model_dtype)  # FIXME move model device & dtype into create_model
     if args.channels_last:
         model = model.to(memory_format=torch.channels_last)
 
     if args.torchscript:
-        assert not use_amp == 'apex', 'Cannot use APEX AMP with torchscripted model'
         model = torch.jit.script(model)
     elif args.torchcompile:
         assert has_compile, 'A version of torch w/ torch.compile() is required for --compile, possibly a nightly.'
         torch._dynamo.reset()
-        model = torch.compile(model, backend=args.torchcompile)
+        model = torch.compile(model, backend=args.torchcompile, mode=args.torchcompile_mode)
     elif args.aot_autograd:
         assert has_functorch, "functorch is needed for --aot-autograd"
         model = memory_efficient_fusion(model)
-
-    if use_amp == 'apex':
-        model = amp.initialize(model, opt_level='O1')
 
     if args.num_gpu > 1:
         model = torch.nn.DataParallel(model, device_ids=list(range(args.num_gpu)))
@@ -275,6 +286,8 @@ def validate(args):
         input_key=args.input_key,
         input_img_mode=input_img_mode,
         target_key=args.target_key,
+        trust_remote_code=args.dataset_trust_remote_code,
+        seed=args.seed,
     )
 
     if args.valid_labels:
@@ -289,42 +302,72 @@ def validate(args):
         real_labels = None
 
     crop_pct = 1.0 if test_time_pool else data_config['crop_pct']
-    loader = create_loader(
-        dataset,
-        input_size=data_config['input_size'],
-        batch_size=args.batch_size,
-        use_prefetcher=args.prefetcher,
-        interpolation=data_config['interpolation'],
-        mean=data_config['mean'],
-        std=data_config['std'],
-        num_workers=args.workers,
-        crop_pct=crop_pct,
-        crop_mode=data_config['crop_mode'],
-        crop_border_pixels=args.crop_border_pixels,
-        pin_memory=args.pin_mem,
-        device=device,
-        tf_preprocessing=args.tf_preprocessing,
-    )
+    if args.naflex_loader:
+        model_patch_size = None
+        if hasattr(model, 'embeds') and hasattr(model.embeds, 'patch_size'):
+            # NaFlexVit models have embeds.patch_size
+            model_patch_size = model.embeds.patch_size
+        from timm.data  import create_naflex_loader
+        loader = create_naflex_loader(
+            dataset,
+            batch_size=args.batch_size,
+            use_prefetcher=args.prefetcher,
+            interpolation=data_config['interpolation'],
+            mean=data_config['mean'],
+            std=data_config['std'],
+            num_workers=args.workers,
+            crop_pct=crop_pct,
+            crop_mode=data_config['crop_mode'],
+            crop_border_pixels=args.crop_border_pixels,
+            pin_memory=args.pin_mem,
+            device=device,
+            img_dtype=model_dtype or torch.float32,
+            patch_size=model_patch_size or (16, 16),
+            max_seq_len=args.naflex_max_seq_len,
+        )
+    else:
+        loader = create_loader(
+            dataset,
+            input_size=data_config['input_size'],
+            batch_size=args.batch_size,
+            use_prefetcher=args.prefetcher,
+            interpolation=data_config['interpolation'],
+            mean=data_config['mean'],
+            std=data_config['std'],
+            num_workers=args.workers,
+            crop_pct=crop_pct,
+            crop_mode=data_config['crop_mode'],
+            crop_border_pixels=args.crop_border_pixels,
+            pin_memory=args.pin_mem,
+            device=device,
+            img_dtype=model_dtype or torch.float32,
+            tf_preprocessing=args.tf_preprocessing,
+        )
 
     batch_time = AverageMeter()
     losses = AverageMeter()
     top1 = AverageMeter()
     top5 = AverageMeter()
 
+    if args.metrics_avg:
+        all_preds = []
+        all_targets = []
+
     model.eval()
-    with torch.no_grad():
+    with torch.inference_mode():
         # warmup, reduce variability of first batch time, especially for comparing torchscript vs non
-        input = torch.randn((args.batch_size,) + tuple(data_config['input_size'])).to(device)
-        if args.channels_last:
-            input = input.contiguous(memory_format=torch.channels_last)
-        with amp_autocast():
-            model(input)
+        if not args.naflex_loader:
+            input = torch.randn((args.batch_size,) + tuple(data_config['input_size'])).to(device=device, dtype=model_dtype)
+            if args.channels_last:
+                input = input.contiguous(memory_format=torch.channels_last)
+            with amp_autocast():
+                model(input)
 
         end = time.time()
         for batch_idx, (input, target) in enumerate(loader):
             if args.no_prefetcher:
-                target = target.to(device)
-                input = input.to(device)
+                target = target.to(device=device)
+                input = input.to(device=device, dtype=model_dtype)
             if args.channels_last:
                 input = input.contiguous(memory_format=torch.channels_last)
 
@@ -340,10 +383,16 @@ def validate(args):
                 real_labels.add_result(output)
 
             # measure accuracy and record loss
+            batch_size = output.shape[0]
             acc1, acc5 = accuracy(output.detach(), target, topk=(1, 5))
-            losses.update(loss.item(), input.size(0))
-            top1.update(acc1.item(), input.size(0))
-            top5.update(acc5.item(), input.size(0))
+            losses.update(loss.item(), batch_size)
+            top1.update(acc1.item(), batch_size)
+            top5.update(acc5.item(), batch_size)
+
+            if args.metrics_avg:
+                predictions = torch.argmax(output, dim=1)
+                all_preds.append(predictions.cpu())
+                all_targets.append(target.cpu())
 
             # measure elapsed time
             batch_time.update(time.time() - end)
@@ -359,7 +408,7 @@ def validate(args):
                         batch_idx,
                         len(loader),
                         batch_time=batch_time,
-                        rate_avg=input.size(0) / batch_time.avg,
+                        rate_avg=batch_size / batch_time.avg,
                         loss=losses,
                         top1=top1,
                         top5=top5
@@ -371,18 +420,41 @@ def validate(args):
         top1a, top5a = real_labels.get_accuracy(k=1), real_labels.get_accuracy(k=5)
     else:
         top1a, top5a = top1.avg, top5.avg
+
+    metric_results = {}
+    if args.metrics_avg:
+        all_preds = torch.cat(all_preds).numpy()
+        all_targets = torch.cat(all_targets).numpy()
+        precision = precision_score(all_targets, all_preds, average=args.metrics_avg, zero_division=0)
+        recall = recall_score(all_targets, all_preds, average=args.metrics_avg, zero_division=0)
+        f1 = f1_score(all_targets, all_preds, average=args.metrics_avg, zero_division=0)
+        metric_results = {
+            f'{args.metrics_avg}_precision': round(100 * precision, 4),
+            f'{args.metrics_avg}_recall': round(100 * recall, 4),
+            f'{args.metrics_avg}_f1_score': round(100 * f1, 4),
+        }
+
     results = OrderedDict(
         model=args.model,
         top1=round(top1a, 4), top1_err=round(100 - top1a, 4),
         top5=round(top5a, 4), top5_err=round(100 - top5a, 4),
+        **metric_results,
         param_count=round(param_count / 1e6, 2),
         img_size=data_config['input_size'][-1],
         crop_pct=crop_pct,
         interpolation=data_config['interpolation'],
     )
 
-    _logger.info(' * Acc@1 {:.3f} ({:.3f}) Acc@5 {:.3f} ({:.3f})'.format(
-       results['top1'], results['top1_err'], results['top5'], results['top5_err']))
+    log_string = ' * Acc@1 {:.3f} ({:.3f}) Acc@5 {:.3f} ({:.3f})'.format(
+       results['top1'], results['top1_err'], results['top5'], results['top5_err'])
+    if metric_results:
+        log_string += ' | Precision({avg}) {prec:.3f} | Recall({avg}) {rec:.3f} | F1-score({avg}) {f1:.3f}'.format(
+            avg=args.metrics_avg,
+            prec=metric_results[f'{args.metrics_avg}_precision'],
+            rec=metric_results[f'{args.metrics_avg}_recall'],
+            f1=metric_results[f'{args.metrics_avg}_f1_score'],
+        )
+    _logger.info(log_string)
 
     return results
 
@@ -394,8 +466,10 @@ def _try_run(args, initial_batch_size):
     while batch_size:
         args.batch_size = batch_size * args.num_gpu  # multiply by num-gpu for DataParallel case
         try:
-            if torch.cuda.is_available() and 'cuda' in args.device:
+            if 'cuda' in args.device and torch.cuda.is_available():
                 torch.cuda.empty_cache()
+            elif "npu" in args.device and torch.npu.is_available():
+                torch.npu.empty_cache()
             results = validate(args)
             return results
         except RuntimeError as e:
@@ -405,6 +479,7 @@ def _try_run(args, initial_batch_size):
                 break
         batch_size = decay_batch_step(batch_size)
         _logger.warning(f'Reducing batch size to {batch_size} for retry.')
+    results['model'] = args.model
     results['error'] = error_str
     _logger.error(f'{args.model} failed to validate ({error_str}).')
     return results

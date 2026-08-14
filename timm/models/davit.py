@@ -12,7 +12,7 @@ DaViT model defs and weights adapted from https://github.com/dingmyu/davit, orig
 # All rights reserved.
 # This source code is licensed under the MIT license
 from functools import partial
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple, Type, Union
 
 import torch
 import torch.nn as nn
@@ -20,21 +20,38 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from timm.data import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
-from timm.layers import DropPath, to_2tuple, trunc_normal_, Mlp, LayerNorm2d, get_norm_layer, use_fused_attn
+from timm.layers import DropPath, calculate_drop_path_rates, to_2tuple, trunc_normal_, Mlp, LayerNorm2d, get_norm_layer, use_fused_attn
 from timm.layers import NormMlpClassifierHead, ClassifierHead
 from ._builder import build_model_with_cfg
+from ._features import feature_take_indices
 from ._features_fx import register_notrace_function
-from ._manipulate import checkpoint_seq
+from ._manipulate import checkpoint, checkpoint_seq
 from ._registry import generate_default_cfgs, register_model
 
 __all__ = ['DaVit']
 
 
 class ConvPosEnc(nn.Module):
-    def __init__(self, dim: int, k: int = 3, act: bool = False):
-        super(ConvPosEnc, self).__init__()
+    def __init__(
+            self,
+            dim: int,
+            k: int = 3,
+            act: bool = False,
+            device=None,
+            dtype=None,
+    ):
+        dd = {'device': device, 'dtype': dtype}
+        super().__init__()
 
-        self.proj = nn.Conv2d(dim, dim, k, 1, k // 2, groups=dim)
+        self.proj = nn.Conv2d(
+            dim,
+            dim,
+            kernel_size=k,
+            stride=1,
+            padding=k // 2,
+            groups=dim,
+            **dd,
+        )
         self.act = nn.GELU() if act else nn.Identity()
 
     def forward(self, x: Tensor):
@@ -50,11 +67,14 @@ class Stem(nn.Module):
 
     def __init__(
             self,
-            in_chs=3,
-            out_chs=96,
-            stride=4,
-            norm_layer=LayerNorm2d,
+            in_chs: int = 3,
+            out_chs: int = 96,
+            stride: int = 4,
+            norm_layer: Type[nn.Module] = LayerNorm2d,
+            device=None,
+            dtype=None,
     ):
+        dd = {'device': device, 'dtype': dtype}
         super().__init__()
         stride = to_2tuple(stride)
         self.stride = stride
@@ -67,13 +87,15 @@ class Stem(nn.Module):
             kernel_size=7,
             stride=stride,
             padding=3,
+            **dd,
         )
-        self.norm = norm_layer(out_chs)
+        self.norm = norm_layer(out_chs, **dd)
 
     def forward(self, x: Tensor):
         B, C, H, W = x.shape
-        x = F.pad(x, (0, (self.stride[1] - W % self.stride[1]) % self.stride[1]))
-        x = F.pad(x, (0, 0, 0, (self.stride[0] - H % self.stride[0]) % self.stride[0]))
+        pad_r = (self.stride[1] - W % self.stride[1]) % self.stride[1]
+        pad_b = (self.stride[0] - H % self.stride[0]) % self.stride[0]
+        x = F.pad(x, (0, pad_r, 0, pad_b))
         x = self.conv(x)
         x = self.norm(x)
         return x
@@ -82,42 +104,99 @@ class Stem(nn.Module):
 class Downsample(nn.Module):
     def __init__(
             self,
-            in_chs,
-            out_chs,
-            norm_layer=LayerNorm2d,
+            in_chs: int,
+            out_chs: int,
+            kernel_size: int = 3,
+            norm_layer: Type[nn.Module] = LayerNorm2d,
+            device=None,
+            dtype=None,
     ):
+        dd = {'device': device, 'dtype': dtype}
         super().__init__()
         self.in_chs = in_chs
         self.out_chs = out_chs
 
-        self.norm = norm_layer(in_chs)
+        self.norm = norm_layer(in_chs, **dd)
+        self.even_k = kernel_size % 2 == 0
         self.conv = nn.Conv2d(
             in_chs,
             out_chs,
-            kernel_size=2,
+            kernel_size=kernel_size,
             stride=2,
-            padding=0,
+            padding=0 if self.even_k else kernel_size // 2,
+            **dd,
         )
 
     def forward(self, x: Tensor):
         B, C, H, W = x.shape
         x = self.norm(x)
-        x = F.pad(x, (0, (2 - W % 2) % 2))
-        x = F.pad(x, (0, 0, 0, (2 - H % 2) % 2))
+        if self.even_k:
+            k_h, k_w = self.conv.kernel_size
+            pad_r = (k_w - W % k_w) % k_w
+            pad_b = (k_h - H % k_h) % k_h
+            x = F.pad(x, (0, pad_r , 0, pad_b))
         x = self.conv(x)
         return x
 
 
+class ChannelAttentionV2(nn.Module):
+
+    def __init__(
+            self,
+            dim: int,
+            num_heads: int = 8,
+            qkv_bias: bool = True,
+            dynamic_scale: bool = True,
+            device=None,
+            dtype=None,
+    ):
+        dd = {'device': device, 'dtype': dtype}
+        super().__init__()
+        self.groups = num_heads
+        self.head_dim = dim // num_heads
+        self.dynamic_scale = dynamic_scale
+
+        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias, **dd)
+        self.proj = nn.Linear(dim, dim, **dd)
+
+    def forward(self, x):
+        B, N, C = x.shape
+
+        qkv = self.qkv(x).reshape(B, N, 3, self.groups, C // self.groups).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv.unbind(0)
+
+        if self.dynamic_scale:
+            q = q * N ** -0.5
+        else:
+            q = q * self.head_dim ** -0.5
+        attn = q.transpose(-1, -2) @ k
+        attn = attn.softmax(dim=-1)
+        x = (attn @ v.transpose(-1, -2)).transpose(-1, -2)
+
+        x = x.transpose(1, 2).reshape(B, N, C)
+        x = self.proj(x)
+        return x
+
+
+
 class ChannelAttention(nn.Module):
 
-    def __init__(self, dim, num_heads=8, qkv_bias=False):
+    def __init__(
+            self,
+            dim: int,
+            num_heads: int = 8,
+            qkv_bias: bool = False,
+            device=None,
+            dtype=None,
+    ):
+        dd = {'device': device, 'dtype': dtype}
         super().__init__()
         self.num_heads = num_heads
         head_dim = dim // num_heads
         self.scale = head_dim ** -0.5
 
-        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
-        self.proj = nn.Linear(dim, dim)
+        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias, **dd)
+        self.proj = nn.Linear(dim, dim, **dd)
 
     def forward(self, x: Tensor):
         B, N, C = x.shape
@@ -138,31 +217,42 @@ class ChannelBlock(nn.Module):
 
     def __init__(
             self,
-            dim,
-            num_heads,
-            mlp_ratio=4.,
-            qkv_bias=False,
-            drop_path=0.,
-            act_layer=nn.GELU,
-            norm_layer=nn.LayerNorm,
-            ffn=True,
-            cpe_act=False,
+            dim: int,
+            num_heads: int,
+            mlp_ratio: float = 4.,
+            qkv_bias: bool = False,
+            drop_path: float = 0.,
+            act_layer: Type[nn.Module] = nn.GELU,
+            norm_layer: Type[nn.Module] = nn.LayerNorm,
+            ffn: bool = True,
+            cpe_act: bool = False,
+            v2: bool = False,
+            device=None,
+            dtype=None,
     ):
+        dd = {'device': device, 'dtype': dtype}
         super().__init__()
 
-        self.cpe1 = ConvPosEnc(dim=dim, k=3, act=cpe_act)
+        self.cpe1 = ConvPosEnc(dim=dim, k=3, act=cpe_act, **dd)
         self.ffn = ffn
-        self.norm1 = norm_layer(dim)
-        self.attn = ChannelAttention(dim, num_heads=num_heads, qkv_bias=qkv_bias)
+        self.norm1 = norm_layer(dim, **dd)
+        attn_layer = ChannelAttentionV2 if v2 else ChannelAttention
+        self.attn = attn_layer(
+            dim,
+            num_heads=num_heads,
+            qkv_bias=qkv_bias,
+            **dd,
+        )
         self.drop_path1 = DropPath(drop_path) if drop_path > 0. else nn.Identity()
-        self.cpe2 = ConvPosEnc(dim=dim, k=3, act=cpe_act)
+        self.cpe2 = ConvPosEnc(dim=dim, k=3, act=cpe_act, **dd)
 
         if self.ffn:
-            self.norm2 = norm_layer(dim)
+            self.norm2 = norm_layer(dim, **dd)
             self.mlp = Mlp(
                 in_features=dim,
                 hidden_features=int(dim * mlp_ratio),
                 act_layer=act_layer,
+                **dd,
             )
             self.drop_path2 = DropPath(drop_path) if drop_path > 0. else nn.Identity()
         else:
@@ -231,7 +321,16 @@ class WindowAttention(nn.Module):
     """
     fused_attn: torch.jit.Final[bool]
 
-    def __init__(self, dim, window_size, num_heads, qkv_bias=True):
+    def __init__(
+            self,
+            dim: int,
+            window_size: Tuple[int, int],
+            num_heads: int,
+            qkv_bias: bool = True,
+            device=None,
+            dtype=None,
+    ):
+        dd = {'device': device, 'dtype': dtype}
         super().__init__()
         self.dim = dim
         self.window_size = window_size
@@ -240,8 +339,8 @@ class WindowAttention(nn.Module):
         self.scale = head_dim ** -0.5
         self.fused_attn = use_fused_attn()
 
-        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
-        self.proj = nn.Linear(dim, dim)
+        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias, **dd)
+        self.proj = nn.Linear(dim, dim, **dd)
 
         self.softmax = nn.Softmax(dim=-1)
 
@@ -279,17 +378,20 @@ class SpatialBlock(nn.Module):
 
     def __init__(
             self,
-            dim,
-            num_heads,
-            window_size=7,
-            mlp_ratio=4.,
-            qkv_bias=True,
-            drop_path=0.,
-            act_layer=nn.GELU,
-            norm_layer=nn.LayerNorm,
-            ffn=True,
-            cpe_act=False,
+            dim: int,
+            num_heads: int,
+            window_size: int = 7,
+            mlp_ratio: float = 4.,
+            qkv_bias: bool = True,
+            drop_path: float = 0.,
+            act_layer: Type[nn.Module] = nn.GELU,
+            norm_layer: Type[nn.Module] = nn.LayerNorm,
+            ffn: bool = True,
+            cpe_act: bool = False,
+            device=None,
+            dtype=None,
     ):
+        dd = {'device': device, 'dtype': dtype}
         super().__init__()
         self.dim = dim
         self.ffn = ffn
@@ -297,24 +399,26 @@ class SpatialBlock(nn.Module):
         self.window_size = to_2tuple(window_size)
         self.mlp_ratio = mlp_ratio
 
-        self.cpe1 = ConvPosEnc(dim=dim, k=3, act=cpe_act)
-        self.norm1 = norm_layer(dim)
+        self.cpe1 = ConvPosEnc(dim=dim, k=3, act=cpe_act, **dd)
+        self.norm1 = norm_layer(dim, **dd)
         self.attn = WindowAttention(
             dim,
             self.window_size,
             num_heads=num_heads,
             qkv_bias=qkv_bias,
+            **dd,
         )
         self.drop_path1 = DropPath(drop_path) if drop_path > 0. else nn.Identity()
 
-        self.cpe2 = ConvPosEnc(dim=dim, k=3, act=cpe_act)
+        self.cpe2 = ConvPosEnc(dim=dim, k=3, act=cpe_act, **dd)
         if self.ffn:
-            self.norm2 = norm_layer(dim)
+            self.norm2 = norm_layer(dim, **dd)
             mlp_hidden_dim = int(dim * mlp_ratio)
             self.mlp = Mlp(
                 in_features=dim,
                 hidden_features=mlp_hidden_dim,
                 act_layer=act_layer,
+                **dd,
             )
             self.drop_path2 = DropPath(drop_path) if drop_path > 0. else nn.Identity()
         else:
@@ -365,44 +469,51 @@ class SpatialBlock(nn.Module):
 class DaVitStage(nn.Module):
     def __init__(
             self,
-            in_chs,
-            out_chs,
-            depth=1,
-            downsample=True,
-            attn_types=('spatial', 'channel'),
-            num_heads=3,
-            window_size=7,
-            mlp_ratio=4,
-            qkv_bias=True,
-            drop_path_rates=(0, 0),
-            norm_layer=LayerNorm2d,
-            norm_layer_cl=nn.LayerNorm,
-            ffn=True,
-            cpe_act=False
+            in_chs: int,
+            out_chs: int,
+            depth:int = 1,
+            downsample: bool = True,
+            attn_types: Tuple[str, ...] = ('spatial', 'channel'),
+            num_heads: int = 3,
+            window_size: int = 7,
+            mlp_ratio: float = 4.,
+            qkv_bias: bool = True,
+            drop_path_rates: Tuple[float, ...] = (0, 0),
+            norm_layer: Type[nn.Module] = LayerNorm2d,
+            norm_layer_cl: Type[nn.Module] = nn.LayerNorm,
+            ffn: bool = True,
+            cpe_act: bool = False,
+            down_kernel_size: int = 2,
+            named_blocks: bool = False,
+            channel_attn_v2: bool = False,
+            device=None,
+            dtype=None,
     ):
+        dd = {'device': device, 'dtype': dtype}
         super().__init__()
 
         self.grad_checkpointing = False
 
         # downsample embedding layer at the beginning of each stage
         if downsample:
-            self.downsample = Downsample(in_chs, out_chs, norm_layer=norm_layer)
+            self.downsample = Downsample(in_chs, out_chs, kernel_size=down_kernel_size, norm_layer=norm_layer, **dd)
         else:
             self.downsample = nn.Identity()
 
         '''
          repeating alternating attention blocks in each stage
          default: (spatial -> channel) x depth
-         
+
          potential opportunity to integrate with a more general version of ByobNet/ByoaNet
          since the logic is similar
         '''
         stage_blocks = []
         for block_idx in range(depth):
+            from collections import OrderedDict
             dual_attention_block = []
             for attn_idx, attn_type in enumerate(attn_types):
                 if attn_type == 'spatial':
-                    dual_attention_block.append(SpatialBlock(
+                    dual_attention_block.append(('spatial_block', SpatialBlock(
                         dim=out_chs,
                         num_heads=num_heads,
                         mlp_ratio=mlp_ratio,
@@ -412,9 +523,10 @@ class DaVitStage(nn.Module):
                         ffn=ffn,
                         cpe_act=cpe_act,
                         window_size=window_size,
-                    ))
+                        **dd,
+                    )))
                 elif attn_type == 'channel':
-                    dual_attention_block.append(ChannelBlock(
+                    dual_attention_block.append(('channel_block', ChannelBlock(
                         dim=out_chs,
                         num_heads=num_heads,
                         mlp_ratio=mlp_ratio,
@@ -422,9 +534,14 @@ class DaVitStage(nn.Module):
                         drop_path=drop_path_rates[block_idx],
                         norm_layer=norm_layer_cl,
                         ffn=ffn,
-                        cpe_act=cpe_act
-                    ))
-            stage_blocks.append(nn.Sequential(*dual_attention_block))
+                        cpe_act=cpe_act,
+                        v2=channel_attn_v2,
+                        **dd,
+                    )))
+            if named_blocks:
+                stage_blocks.append(nn.Sequential(OrderedDict(dual_attention_block)))
+            else:
+                stage_blocks.append(nn.Sequential(*[b[1] for b in dual_attention_block]))
         self.blocks = nn.Sequential(*stage_blocks)
 
     @torch.jit.ignore
@@ -444,7 +561,7 @@ class DaVit(nn.Module):
     r""" DaViT
         A PyTorch implementation of `DaViT: Dual Attention Vision Transformers`  - https://arxiv.org/abs/2204.03645
         Supports arbitrary input sizes and pyramid feature extraction
-        
+
     Args:
         in_chans (int): Number of input image channels. Default: 3
         num_classes (int): Number of classes for classification head. Default: 1000
@@ -460,62 +577,73 @@ class DaVit(nn.Module):
 
     def __init__(
             self,
-            in_chans=3,
-            depths=(1, 1, 3, 1),
-            embed_dims=(96, 192, 384, 768),
-            num_heads=(3, 6, 12, 24),
-            window_size=7,
-            mlp_ratio=4,
-            qkv_bias=True,
-            norm_layer='layernorm2d',
-            norm_layer_cl='layernorm',
-            norm_eps=1e-5,
-            attn_types=('spatial', 'channel'),
-            ffn=True,
-            cpe_act=False,
-            drop_rate=0.,
-            drop_path_rate=0.,
-            num_classes=1000,
-            global_pool='avg',
-            head_norm_first=False,
+            in_chans: int = 3,
+            depths: Tuple[int, ...] = (1, 1, 3, 1),
+            embed_dims: Tuple[int, ...] = (96, 192, 384, 768),
+            num_heads: Tuple[int, ...] = (3, 6, 12, 24),
+            window_size: int = 7,
+            mlp_ratio: float = 4,
+            qkv_bias: bool = True,
+            norm_layer: str = 'layernorm2d',
+            norm_layer_cl: str = 'layernorm',
+            norm_eps: float = 1e-5,
+            attn_types: Tuple[str, ...] = ('spatial', 'channel'),
+            ffn: bool = True,
+            cpe_act: bool = False,
+            down_kernel_size: int = 2,
+            channel_attn_v2: bool = False,
+            named_blocks: bool = False,
+            drop_rate: float = 0.,
+            drop_path_rate: float = 0.,
+            num_classes: int = 1000,
+            global_pool: str = 'avg',
+            head_norm_first: bool = False,
+            device=None,
+            dtype=None,
     ):
         super().__init__()
+        dd = {'device': device, 'dtype': dtype}
         num_stages = len(embed_dims)
         assert num_stages == len(num_heads) == len(depths)
         norm_layer = partial(get_norm_layer(norm_layer), eps=norm_eps)
         norm_layer_cl = partial(get_norm_layer(norm_layer_cl), eps=norm_eps)
         self.num_classes = num_classes
-        self.num_features = embed_dims[-1]
+        self.in_chans = in_chans
+        self.num_features = self.head_hidden_size = embed_dims[-1]
         self.drop_rate = drop_rate
         self.grad_checkpointing = False
         self.feature_info = []
 
-        self.stem = Stem(in_chans, embed_dims[0], norm_layer=norm_layer)
+        self.stem = Stem(in_chans, embed_dims[0], norm_layer=norm_layer, **dd)
         in_chs = embed_dims[0]
 
-        dpr = [x.tolist() for x in torch.linspace(0, drop_path_rate, sum(depths)).split(depths)]
+        dpr = calculate_drop_path_rates(drop_path_rate, depths, stagewise=True)
         stages = []
-        for stage_idx in range(num_stages):
-            out_chs = embed_dims[stage_idx]
+        for i in range(num_stages):
+            out_chs = embed_dims[i]
             stage = DaVitStage(
                 in_chs,
                 out_chs,
-                depth=depths[stage_idx],
-                downsample=stage_idx > 0,
+                depth=depths[i],
+                downsample=i > 0,
                 attn_types=attn_types,
-                num_heads=num_heads[stage_idx],
+                num_heads=num_heads[i],
                 window_size=window_size,
                 mlp_ratio=mlp_ratio,
                 qkv_bias=qkv_bias,
-                drop_path_rates=dpr[stage_idx],
+                drop_path_rates=dpr[i],
                 norm_layer=norm_layer,
                 norm_layer_cl=norm_layer_cl,
                 ffn=ffn,
                 cpe_act=cpe_act,
+                down_kernel_size=down_kernel_size,
+                channel_attn_v2=channel_attn_v2,
+                named_blocks=named_blocks,
+                **dd,
             )
             in_chs = out_chs
             stages.append(stage)
-            self.feature_info += [dict(num_chs=out_chs, reduction=2, module=f'stages.{stage_idx}')]
+            self.feature_info += [dict(num_chs=out_chs, reduction=2**(i+2), module=f'stages.{i}')]
 
         self.stages = nn.Sequential(*stages)
 
@@ -523,12 +651,13 @@ class DaVit(nn.Module):
         # otherwise pool -> norm -> fc, the default DaViT order, similar to ConvNeXt
         # FIXME generalize this structure to ClassifierHead
         if head_norm_first:
-            self.norm_pre = norm_layer(self.num_features)
+            self.norm_pre = norm_layer(self.num_features, **dd)
             self.head = ClassifierHead(
                 self.num_features,
                 num_classes,
                 pool_type=global_pool,
                 drop_rate=self.drop_rate,
+                **dd,
             )
         else:
             self.norm_pre = nn.Identity()
@@ -538,6 +667,7 @@ class DaVit(nn.Module):
                 pool_type=global_pool,
                 drop_rate=self.drop_rate,
                 norm_layer=norm_layer,
+                **dd,
             )
         self.apply(self._init_weights)
 
@@ -565,11 +695,81 @@ class DaVit(nn.Module):
             stage.set_grad_checkpointing(enable=enable)
 
     @torch.jit.ignore
-    def get_classifier(self):
+    def get_classifier(self) -> nn.Module:
         return self.head.fc
 
     def reset_classifier(self, num_classes: int, global_pool: Optional[str] = None):
+        self.num_classes = num_classes
         self.head.reset(num_classes, global_pool)
+
+    def forward_intermediates(
+            self,
+            x: torch.Tensor,
+            indices: Optional[Union[int, List[int]]] = None,
+            norm: bool = False,
+            stop_early: bool = False,
+            output_fmt: str = 'NCHW',
+            intermediates_only: bool = False,
+    ) -> Union[List[torch.Tensor], Tuple[torch.Tensor, List[torch.Tensor]]]:
+        """ Forward features that returns intermediates.
+
+        Args:
+            x: Input image tensor
+            indices: Take last n blocks if int, all if None, select matching indices if sequence
+            norm: Apply norm layer to compatible intermediates
+            stop_early: Stop iterating over blocks when last desired intermediate hit
+            output_fmt: Shape of intermediate feature outputs
+            intermediates_only: Only return intermediate features
+        Returns:
+
+        """
+        assert output_fmt in ('NCHW',), 'Output shape must be NCHW.'
+        intermediates = []
+        take_indices, max_index = feature_take_indices(len(self.stages), indices)
+
+        # forward pass
+        x = self.stem(x)
+        last_idx = len(self.stages) - 1
+        if torch.jit.is_scripting() or not stop_early:  # can't slice blocks in torchscript
+            stages = self.stages
+        else:
+            stages = self.stages[:max_index + 1]
+
+        for feat_idx, stage in enumerate(stages):
+            if self.grad_checkpointing and not torch.jit.is_scripting():
+                x = checkpoint(stage, x)
+            else:
+                x = stage(x)
+            if feat_idx in take_indices:
+                if norm and feat_idx == last_idx:
+                    x_inter = self.norm_pre(x)  # applying final norm to last intermediate
+                else:
+                    x_inter = x
+                intermediates.append(x_inter)
+
+        if intermediates_only:
+            return intermediates
+
+        if feat_idx == last_idx:
+            x = self.norm_pre(x)
+
+        return x, intermediates
+
+    def prune_intermediate_layers(
+            self,
+            indices: Union[int, List[int]] = 1,
+            prune_norm: bool = False,
+            prune_head: bool = True,
+    ):
+        """ Prune layers not required for specified intermediates.
+        """
+        take_indices, max_index = feature_take_indices(len(self.stages), indices)
+        self.stages = self.stages[:max_index + 1]  # truncate blocks w/ stem as idx 0
+        if prune_norm:
+            self.norm_pre = nn.Identity()
+        if prune_head:
+            self.reset_classifier(0, '')
+        return take_indices
 
     def forward_features(self, x):
         x = self.stem(x)
@@ -589,6 +789,34 @@ class DaVit(nn.Module):
         return x
 
 
+def _convert_florence2(state_dict, model, prefix='vision_tower.'):
+    import re
+    out_dict = {}
+
+    for k, v in state_dict.items():
+        if k.startswith(prefix):
+            k = k.replace(prefix, '')
+        else:
+            continue
+        k = re.sub(r'convs.([0-9]+)', r'stages.\1.downsample', k)
+        k = re.sub(r'blocks.([0-9]+)', r'stages.\1.blocks', k)
+        k = k.replace('downsample.proj', 'downsample.conv')
+        k = k.replace('stages.0.downsample', 'stem')
+        #k = k.replace('head.', 'head.fc.')
+        #k = k.replace('norms.', 'head.norm.')
+        k = k.replace('window_attn.norm.', 'norm1.')
+        k = k.replace('window_attn.fn.', 'attn.')
+        k = k.replace('channel_attn.norm.', 'norm1.')
+        k = k.replace('channel_attn.fn.', 'attn.')
+        k = k.replace('ffn.norm.', 'norm2.')
+        k = k.replace('ffn.fn.net.', 'mlp.')
+        k = k.replace('conv1.fn.dw', 'cpe1.proj')
+        k = k.replace('conv2.fn.dw', 'cpe2.proj')
+        out_dict[k] = v
+
+    return out_dict
+
+
 def checkpoint_filter_fn(state_dict, model):
     """ Remap MSFT checkpoints -> timm """
     if 'head.fc.weight' in state_dict:
@@ -596,6 +824,9 @@ def checkpoint_filter_fn(state_dict, model):
 
     if 'state_dict' in state_dict:
         state_dict = state_dict['state_dict']
+
+    if 'vision_tower.convs.0.proj.weight' in state_dict:
+        return _convert_florence2(state_dict, model)
 
     import re
     out_dict = {}
@@ -616,12 +847,18 @@ def _create_davit(variant, pretrained=False, **kwargs):
     default_out_indices = tuple(i for i, _ in enumerate(kwargs.get('depths', (1, 1, 3, 1))))
     out_indices = kwargs.pop('out_indices', default_out_indices)
 
+    strict = kwargs.pop('pretrained_strict', True)
+    if variant.endswith('_fl'):
+        # FIXME cleaner approach to missing head norm?
+        strict = False
+
     model = build_model_with_cfg(
         DaVit,
         variant,
         pretrained,
         pretrained_filter_fn=checkpoint_filter_fn,
         feature_cfg=dict(flatten_sequential=True, out_indices=out_indices),
+        pretrained_strict=strict,
         **kwargs)
 
     return model
@@ -634,6 +871,7 @@ def _cfg(url='', **kwargs):
         'crop_pct': 0.95, 'interpolation': 'bicubic',
         'mean': IMAGENET_DEFAULT_MEAN, 'std': IMAGENET_DEFAULT_STD,
         'first_conv': 'stem.conv', 'classifier': 'head.fc',
+        'license': 'apache-2.0',
         **kwargs
     }
 
@@ -650,6 +888,12 @@ default_cfgs = generate_default_cfgs({
     'davit_large': _cfg(),
     'davit_huge': _cfg(),
     'davit_giant': _cfg(),
+    'davit_base_fl.msft_florence2': _cfg(
+        hf_hub_id='microsoft/Florence-2-base',
+        num_classes=0, input_size=(3, 768, 768)),
+    'davit_huge_fl.msft_florence2': _cfg(
+        hf_hub_id='microsoft/Florence-2-large',
+        num_classes=0, input_size=(3, 768, 768)),
 })
 
 
@@ -687,3 +931,23 @@ def davit_huge(pretrained=False, **kwargs) -> DaVit:
 def davit_giant(pretrained=False, **kwargs) -> DaVit:
     model_args = dict(depths=(1, 1, 12, 3), embed_dims=(384, 768, 1536, 3072), num_heads=(12, 24, 48, 96))
     return _create_davit('davit_giant', pretrained=pretrained, **dict(model_args, **kwargs))
+
+
+
+@register_model
+def davit_base_fl(pretrained=False, **kwargs) -> DaVit:
+    model_args = dict(
+        depths=(1, 1, 9, 1), embed_dims=(128, 256, 512, 1024), num_heads=(4, 8, 16, 32),
+        window_size=12, down_kernel_size=3, channel_attn_v2=True, named_blocks=True,
+    )
+    return _create_davit('davit_base_fl', pretrained=pretrained, **dict(model_args, **kwargs))
+
+
+@register_model
+def davit_huge_fl(pretrained=False, **kwargs) -> DaVit:
+    # NOTE: huge image tower used in 'large' Florence2 model
+    model_args = dict(
+        depths=(1, 1, 9, 1), embed_dims=(256, 512, 1024, 2048), num_heads=(8, 16, 32, 64),
+        window_size=12, down_kernel_size=3, channel_attn_v2=True, named_blocks=True,
+    )
+    return _create_davit('davit_huge_fl', pretrained=pretrained, **dict(model_args, **kwargs))

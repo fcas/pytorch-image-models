@@ -1,4 +1,13 @@
-from functools import update_wrapper, wraps
+""" SGD with decoupled weight-decay.
+
+References for added functionality:
+    Cautious Optimizers: https://arxiv.org/abs/2411.16085
+    Why Gradients Rapidly Increase Near the End of Training: https://arxiv.org/abs/2506.02285
+
+Hacked together by Ross Wightman
+"""
+from typing import List, Optional
+
 import torch
 from torch import Tensor
 from torch.optim.optimizer import Optimizer
@@ -8,7 +17,7 @@ try:
 except ImportError:
     has_recent_pt = False
 
-from typing import List, Optional
+from ._types import ParamsT
 
 __all__ = ['SGDW', 'sgdw']
 
@@ -16,13 +25,15 @@ __all__ = ['SGDW', 'sgdw']
 class SGDW(Optimizer):
     def __init__(
             self,
-            params,
-            lr=1e-3,
-            momentum=0,
-            dampening=0,
-            weight_decay=0,
-            nesterov=False,
+            params: ParamsT,
+            lr: float = 1e-3,
+            momentum: float = 0.,
+            dampening: float = 0.,
+            weight_decay: float = 0.,
+            nesterov: bool = False,
             *,
+            caution: bool = False,
+            corrected_weight_decay: bool = False,
             maximize: bool = False,
             foreach: Optional[bool] = None,
             differentiable: bool = False,
@@ -35,10 +46,17 @@ class SGDW(Optimizer):
             raise ValueError(f"Invalid weight_decay value: {weight_decay}")
 
         defaults = dict(
-            lr=lr, momentum=momentum, dampening=dampening,
-            weight_decay=weight_decay, nesterov=nesterov,
-            maximize=maximize, foreach=foreach,
-            differentiable=differentiable)
+            lr=lr,
+            momentum=momentum,
+            dampening=dampening,
+            weight_decay=weight_decay,
+            nesterov=nesterov,
+            caution=caution,
+            corrected_weight_decay=corrected_weight_decay,
+            maximize=maximize,
+            foreach=foreach,
+            differentiable=differentiable,
+        )
         if nesterov and (momentum <= 0 or dampening != 0):
             raise ValueError("Nesterov momentum requires a momentum and zero dampening")
         super().__init__(params, defaults)
@@ -46,18 +64,20 @@ class SGDW(Optimizer):
     def __setstate__(self, state):
         super().__setstate__(state)
         for group in self.param_groups:
+            group.setdefault('caution', False)
+            group.setdefault('corrected_weight_decay', False)
             group.setdefault('nesterov', False)
             group.setdefault('maximize', False)
             group.setdefault('foreach', None)
             group.setdefault('differentiable', False)
 
-    def _init_group(self, group, params_with_grad, d_p_list, momentum_buffer_list):
+    def _init_group(self, group, params_with_grad, grads, momentum_buffer_list):
         has_sparse_grad = False
 
         for p in group['params']:
             if p.grad is not None:
                 params_with_grad.append(p)
-                d_p_list.append(p.grad)
+                grads.append(p.grad)
                 if p.grad.is_sparse:
                     has_sparse_grad = True
 
@@ -86,23 +106,25 @@ class SGDW(Optimizer):
 
         for group in self.param_groups:
             params_with_grad = []
-            d_p_list = []
+            grads = []
             momentum_buffer_list = []
 
-            has_sparse_grad = self._init_group(group, params_with_grad, d_p_list, momentum_buffer_list)
+            has_sparse_grad = self._init_group(group, params_with_grad, grads, momentum_buffer_list)
 
             sgdw(
                 params_with_grad,
-                d_p_list,
+                grads,
                 momentum_buffer_list,
                 weight_decay=group['weight_decay'],
                 momentum=group['momentum'],
                 lr=group['lr'],
                 dampening=group['dampening'],
                 nesterov=group['nesterov'],
+                caution=group['caution'],
                 maximize=group['maximize'],
                 has_sparse_grad=has_sparse_grad,
                 foreach=group['foreach'],
+                max_lr=self.defaults['lr'] if group['corrected_weight_decay'] else None,
             )
 
             # update momentum_buffers in state
@@ -115,7 +137,7 @@ class SGDW(Optimizer):
 
 def sgdw(
         params: List[Tensor],
-        d_p_list: List[Tensor],
+        grads: List[Tensor],
         momentum_buffer_list: List[Optional[Tensor]],
         # kwonly args with defaults are not supported by functions compiled with torchscript issue #70627
         # setting this as kwarg for now as functional API is compiled by torch/distributed/optim
@@ -127,7 +149,9 @@ def sgdw(
         lr: float,
         dampening: float,
         nesterov: bool,
-        maximize: bool
+        caution: bool,
+        maximize: bool,
+        max_lr: Optional[float] = None
 ):
     r"""Functional API that performs SGD algorithm computation.
 
@@ -154,21 +178,23 @@ def sgdw(
 
     func(
         params,
-        d_p_list,
+        grads,
         momentum_buffer_list,
         weight_decay=weight_decay,
         momentum=momentum,
         lr=lr,
         dampening=dampening,
         nesterov=nesterov,
+        caution=caution,
         has_sparse_grad=has_sparse_grad,
         maximize=maximize,
+        max_lr=max_lr,
     )
 
 
 def _single_tensor_sgdw(
         params: List[Tensor],
-        d_p_list: List[Tensor],
+        grads: List[Tensor],
         momentum_buffer_list: List[Optional[Tensor]],
         *,
         weight_decay: float,
@@ -176,29 +202,40 @@ def _single_tensor_sgdw(
         lr: float,
         dampening: float,
         nesterov: bool,
+        caution: bool,
         maximize: bool,
-        has_sparse_grad: bool
+        has_sparse_grad: bool,
+        max_lr: Optional[float]
 ):
     for i, param in enumerate(params):
-        d_p = d_p_list[i] if not maximize else -d_p_list[i]
+        grad = grads[i] if not maximize else -grads[i]
 
-        param.mul_(1. - lr * weight_decay)
+        wd_scale = lr if max_lr is None else lr ** 2 / max_lr
+        param.mul_(1. - wd_scale * weight_decay)
 
         if momentum != 0:
             buf = momentum_buffer_list[i]
 
             if buf is None:
-                buf = torch.clone(d_p).detach()
+                buf = torch.clone(grad).detach()
                 momentum_buffer_list[i] = buf
             else:
-                buf.mul_(momentum).add_(d_p, alpha=1 - dampening)
+                buf.mul_(momentum).add_(grad, alpha=1 - dampening)
 
-            if nesterov:
-                d_p = d_p.add(buf, alpha=momentum)
+            if caution:
+                if nesterov:
+                    buf = grad.add(buf, alpha=momentum)
+                # Apply caution as per 'Cautious Optimizers' - https://arxiv.org/abs/2411.16085
+                mask = (buf * grad > 0).to(grad.dtype)
+                mask.div_(mask.mean().clamp_(min=1e-3))
+                grad = buf * mask
             else:
-                d_p = buf
+                if nesterov:
+                    grad = grad.add(buf, alpha=momentum)
+                else:
+                    grad = buf
 
-        param.add_(d_p, alpha=-lr)
+        param.add_(grad, alpha=-lr)
 
 
 def _multi_tensor_sgdw(
@@ -211,8 +248,10 @@ def _multi_tensor_sgdw(
         lr: float,
         dampening: float,
         nesterov: bool,
+        caution: bool,
         maximize: bool,
-        has_sparse_grad: bool
+        has_sparse_grad: bool,
+        max_lr: Optional[float]
 ):
     if len(params) == 0:
         return
@@ -225,7 +264,8 @@ def _multi_tensor_sgdw(
         if maximize:
             device_grads = torch._foreach_neg(device_grads)
 
-        torch._foreach_mul_(params, 1. - lr * weight_decay)
+        wd_scale = lr if max_lr is None else lr ** 2 / max_lr
+        torch._foreach_mul_(params, 1. - wd_scale * weight_decay)
 
         if momentum != 0:
             bufs = []
@@ -253,10 +293,22 @@ def _multi_tensor_sgdw(
 
                     bufs.append(buf)
 
-            if nesterov:
-                torch._foreach_add_(device_grads, bufs, alpha=momentum)
+            if caution:
+                if nesterov:
+                    # Can't do nesterov in-place if we want to compare against orig grad for caution
+                    bufs = torch._foreach_add(device_grads, bufs, alpha=momentum)
+                # Apply caution as per 'Cautious Optimizers' - https://arxiv.org/abs/2411.16085
+                masks = torch._foreach_mul(bufs, device_grads)
+                masks = [(m > 0).to(g.dtype) for m, g in zip(masks, device_grads)]
+                mask_scale = [m.mean() for m in masks]
+                torch._foreach_maximum_(mask_scale, 1e-3)
+                torch._foreach_div_(masks, mask_scale)
+                device_grads = torch._foreach_mul(bufs, masks)
             else:
-                device_grads = bufs
+                if nesterov:
+                    torch._foreach_add_(device_grads, bufs, alpha=momentum)
+                else:
+                    device_grads = bufs
 
         if not device_has_sparse_grad:
             torch._foreach_add_(device_params, device_grads, alpha=-lr)

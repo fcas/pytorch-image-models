@@ -5,7 +5,7 @@ import os
 from functools import partial
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import Iterable, Optional, Union
+from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
 from torch.hub import HASH_REGEX, download_url_to_file, urlparse
@@ -27,14 +27,12 @@ except ImportError:
     from typing_extensions import Literal
 
 from timm import __version__
-from timm.models._pretrained import filter_pretrained_cfg
+from ._helpers import _torch_load, load_state_dict
+from ._pretrained import filter_pretrained_cfg
 
 try:
-    from huggingface_hub import (
-        create_repo, get_hf_file_metadata,
-        hf_hub_download, hf_hub_url,
-        repo_type_and_id_from_hf_id, upload_folder)
-    from huggingface_hub.utils import EntryNotFoundError
+    from huggingface_hub import HfApi, hf_hub_download, model_info
+    from huggingface_hub.utils import EntryNotFoundError, RepositoryNotFoundError
     hf_hub_download = partial(hf_hub_download, library_name="timm", library_version=__version__)
     _has_hf_hub = True
 except ImportError:
@@ -53,7 +51,7 @@ HF_OPEN_CLIP_WEIGHTS_NAME = "open_clip_pytorch_model.bin"  # default pytorch pkl
 HF_OPEN_CLIP_SAFE_WEIGHTS_NAME = "open_clip_model.safetensors"  # safetensors version
 
 
-def get_cache_dir(child_dir=''):
+def get_cache_dir(child_dir: str = ''):
     """
     Returns the location of the directory where models are cached (and creates it if necessary).
     """
@@ -68,13 +66,22 @@ def get_cache_dir(child_dir=''):
     return model_dir
 
 
-def download_cached_file(url, check_hash=True, progress=False):
+def download_cached_file(
+        url: Union[str, List[str], Tuple[str, str]],
+        check_hash: bool = True,
+        progress: bool = False,
+        cache_dir: Optional[Union[str, Path]] = None,
+):
     if isinstance(url, (list, tuple)):
         url, filename = url
     else:
         parts = urlparse(url)
         filename = os.path.basename(parts.path)
-    cached_file = os.path.join(get_cache_dir(), filename)
+    if cache_dir:
+        os.makedirs(cache_dir, exist_ok=True)
+    else:
+        cache_dir = get_cache_dir()
+    cached_file = os.path.join(cache_dir, filename)
     if not os.path.exists(cached_file):
         _logger.info('Downloading: "{}" to {}\n'.format(url, cached_file))
         hash_prefix = None
@@ -85,13 +92,19 @@ def download_cached_file(url, check_hash=True, progress=False):
     return cached_file
 
 
-def check_cached_file(url, check_hash=True):
+def check_cached_file(
+        url: Union[str, List[str], Tuple[str, str]],
+        check_hash: bool = True,
+        cache_dir: Optional[Union[str, Path]] = None,
+):
     if isinstance(url, (list, tuple)):
         url, filename = url
     else:
         parts = urlparse(url)
         filename = os.path.basename(parts.path)
-    cached_file = os.path.join(get_cache_dir(), filename)
+    if not cache_dir:
+        cache_dir = get_cache_dir()
+    cached_file = os.path.join(cache_dir, filename)
     if os.path.exists(cached_file):
         if check_hash:
             r = HASH_REGEX.search(filename)  # r is Optional[Match[str]]
@@ -105,7 +118,7 @@ def check_cached_file(url, check_hash=True):
     return False
 
 
-def has_hf_hub(necessary=False):
+def has_hf_hub(necessary: bool = False):
     if not _has_hf_hub and necessary:
         # if no HF Hub module installed, and it is necessary to continue, raise error
         raise RuntimeError(
@@ -122,61 +135,112 @@ def hf_split(hf_id: str):
     return hf_model_id, hf_revision
 
 
-def load_cfg_from_json(json_file: Union[str, os.PathLike]):
+def load_cfg_from_json(json_file: Union[str, Path]):
     with open(json_file, "r", encoding="utf-8") as reader:
         text = reader.read()
     return json.loads(text)
 
 
-def download_from_hf(model_id: str, filename: str):
+def download_from_hf(
+        model_id: str,
+        filename: str,
+        cache_dir: Optional[Union[str, Path]] = None,
+):
     hf_model_id, hf_revision = hf_split(model_id)
-    return hf_hub_download(hf_model_id, filename, revision=hf_revision)
+    return hf_hub_download(
+        hf_model_id,
+        filename,
+        revision=hf_revision,
+        cache_dir=cache_dir,
+    )
 
 
-def load_model_config_from_hf(model_id: str):
-    assert has_hf_hub(True)
-    cached_file = download_from_hf(model_id, 'config.json')
+def _parse_model_cfg(
+        cfg: Dict[str, Any],
+        extra_fields: Dict[str, Any],
+) -> Tuple[Dict[str, Any], str, Dict[str, Any]]:
+    """"""
+    # legacy "single‑dict" → split
+    if "pretrained_cfg" not in cfg:
+        pretrained_cfg = cfg
+        cfg = {
+            "architecture": pretrained_cfg.pop("architecture"),
+            "num_features": pretrained_cfg.pop("num_features", None),
+            "pretrained_cfg": pretrained_cfg,
+        }
+        if "labels" in pretrained_cfg:                  # rename ‑‑> label_names
+            pretrained_cfg["label_names"] = pretrained_cfg.pop("labels")
 
-    hf_config = load_cfg_from_json(cached_file)
-    if 'pretrained_cfg' not in hf_config:
-        # old form, pull pretrain_cfg out of the base dict
-        pretrained_cfg = hf_config
-        hf_config = {}
-        hf_config['architecture'] = pretrained_cfg.pop('architecture')
-        hf_config['num_features'] = pretrained_cfg.pop('num_features', None)
-        if 'labels' in pretrained_cfg:  # deprecated name for 'label_names'
-            pretrained_cfg['label_names'] = pretrained_cfg.pop('labels')
-        hf_config['pretrained_cfg'] = pretrained_cfg
+    pretrained_cfg = cfg["pretrained_cfg"]
+    pretrained_cfg.update(extra_fields)
 
-    # NOTE currently discarding parent config as only arch name and pretrained_cfg used in timm right now
-    pretrained_cfg = hf_config['pretrained_cfg']
-    pretrained_cfg['hf_hub_id'] = model_id  # insert hf_hub id for pretrained weight load during model creation
-    pretrained_cfg['source'] = 'hf-hub'
+    # top‑level overrides
+    if "num_classes" in cfg:
+        pretrained_cfg["num_classes"] = cfg["num_classes"]
+    if "label_names" in cfg:
+        pretrained_cfg["label_names"] = cfg.pop("label_names")
+    if "label_descriptions" in cfg:
+        pretrained_cfg["label_descriptions"] = cfg.pop("label_descriptions")
 
-    # model should be created with base config num_classes if its exist
-    if 'num_classes' in hf_config:
-        pretrained_cfg['num_classes'] = hf_config['num_classes']
-
-    # label meta-data in base config overrides saved pretrained_cfg on load
-    if 'label_names' in hf_config:
-        pretrained_cfg['label_names'] = hf_config.pop('label_names')
-    if 'label_descriptions' in hf_config:
-        pretrained_cfg['label_descriptions'] = hf_config.pop('label_descriptions')
-
-    model_args = hf_config.get('model_args', {})
-    model_name = hf_config['architecture']
+    model_args = cfg.get("model_args", {})
+    model_name = cfg["architecture"]
     return pretrained_cfg, model_name, model_args
 
 
-def load_state_dict_from_hf(model_id: str, filename: str = HF_WEIGHTS_NAME):
+def load_model_config_from_hf(
+        model_id: str,
+        cache_dir: Optional[Union[str, Path]] = None,
+):
+    """Original HF‑Hub loader (unchanged download, shared parsing)."""
+    assert has_hf_hub(True)
+    cfg_path = download_from_hf(model_id, "config.json", cache_dir=cache_dir)
+    cfg = load_cfg_from_json(cfg_path)
+    return _parse_model_cfg(cfg, {"hf_hub_id": model_id, "source": "hf-hub"})
+
+
+def load_model_config_from_path(
+        model_path: Union[str, Path],
+):
+    """Load from ``<model_path>/config.json`` on the local filesystem."""
+    model_path = Path(model_path)
+    cfg_file = model_path / "config.json"
+    if not cfg_file.is_file():
+        raise FileNotFoundError(f"Config file not found: {cfg_file}")
+    cfg = load_cfg_from_json(cfg_file)
+    extra_fields = {"file": str(model_path), "source": "local-dir"}
+    return _parse_model_cfg(cfg, extra_fields=extra_fields)
+
+
+def load_state_dict_from_hf(
+        model_id: str,
+        filename: str = HF_WEIGHTS_NAME,
+        weights_only: bool = True,
+        cache_dir: Optional[Union[str, Path]] = None,
+):
     assert has_hf_hub(True)
     hf_model_id, hf_revision = hf_split(model_id)
+
+    # Load directly via safetensors if that's what the filename specifies
+    if filename.endswith(".safetensors"):
+        assert _has_safetensors, "`pip install safetensors` to use .safetensors"
+        cached_safe_file = hf_hub_download(
+            repo_id=hf_model_id,
+            filename=filename,
+            revision=hf_revision,
+            cache_dir=cache_dir,
+        )
+        return safetensors.torch.load_file(cached_safe_file, device="cpu")
 
     # Look for .safetensors alternatives and load from it if it exists
     if _has_safetensors:
         for safe_filename in _get_safe_alternatives(filename):
             try:
-                cached_safe_file = hf_hub_download(repo_id=hf_model_id, filename=safe_filename, revision=hf_revision)
+                cached_safe_file = hf_hub_download(
+                    repo_id=hf_model_id,
+                    filename=safe_filename,
+                    revision=hf_revision,
+                    cache_dir=cache_dir,
+                )
                 _logger.info(
                     f"[{model_id}] Safe alternative available for '{filename}' "
                     f"(as '{safe_filename}'). Loading weights using safetensors.")
@@ -185,20 +249,85 @@ def load_state_dict_from_hf(model_id: str, filename: str = HF_WEIGHTS_NAME):
                 pass
 
     # Otherwise, load using pytorch.load
-    cached_file = hf_hub_download(hf_model_id, filename=filename, revision=hf_revision)
+    cached_file = hf_hub_download(
+        hf_model_id,
+        filename=filename,
+        revision=hf_revision,
+        cache_dir=cache_dir,
+    )
     _logger.debug(f"[{model_id}] Safe alternative not found for '{filename}'. Loading weights using default pytorch.")
-    return torch.load(cached_file, map_location='cpu')
+    state_dict = _torch_load(cached_file, map_location='cpu', weights_only=weights_only)
+
+    return state_dict
 
 
-def load_custom_from_hf(model_id: str, filename: str, model: torch.nn.Module):
+_PREFERRED_FILES = (
+    "model.safetensors",
+    "pytorch_model.bin",
+    "pytorch_model.pth",
+    "model.pth",
+    "open_clip_model.safetensors",
+    "open_clip_pytorch_model.safetensors",
+    "open_clip_pytorch_model.bin",
+    "open_clip_pytorch_model.pth",
+)
+_EXT_PRIORITY = ('.safetensors', '.pth', '.pth.tar', '.bin')
+
+
+def load_state_dict_from_path(
+        path: Union[str, Path],
+        weights_only: bool = True,
+):
+    path = Path(path)
+    found_file = None
+    for fname in _PREFERRED_FILES:
+        p = path / fname
+        if p.exists():
+            _logger.info(f"Found preferred checkpoint: {p.name}")
+            found_file = p
+            break
+
+    if found_file is None:
+        # fallback: first match per‑extension class, in extension priority order
+        for ext in _EXT_PRIORITY:
+            files = sorted(path.glob(f"*{ext}"))
+            if files:
+                if len(files) > 1:
+                    names = [f.name for f in files]
+                    _logger.warning(
+                        f"Multiple {ext} checkpoints in {path}: {names}. "
+                        f"Using '{files[0].name}'."
+                    )
+                found_file = files[0]
+                break
+
+    if not found_file:
+        raise RuntimeError(f"No suitable checkpoints found in {path}.")
+
+    state_dict = load_state_dict(found_file, weights_only=weights_only)
+
+    return state_dict
+
+
+def load_custom_from_hf(
+        model_id: str,
+        filename: str,
+        model: torch.nn.Module,
+        cache_dir: Optional[Union[str, Path]] = None,
+):
     assert has_hf_hub(True)
     hf_model_id, hf_revision = hf_split(model_id)
-    cached_file = hf_hub_download(hf_model_id, filename=filename, revision=hf_revision)
+    cached_file = hf_hub_download(
+        hf_model_id,
+        filename=filename,
+        revision=hf_revision,
+        cache_dir=cache_dir,
+    )
     return model.load_pretrained(cached_file)
 
 
 def save_config_for_hf(
-        model,
+        model: torch.nn.Module,
         config_path: str,
         model_config: Optional[dict] = None,
         model_args: Optional[dict] = None
@@ -247,7 +376,7 @@ def save_config_for_hf(
 
 
 def save_for_hf(
-        model,
+        model: torch.nn.Module,
         save_directory: str,
         model_config: Optional[dict] = None,
         model_args: Optional[dict] = None,
@@ -285,7 +414,8 @@ def push_to_hf_hub(
         model_config: Optional[dict] = None,
         model_card: Optional[dict] = None,
         model_args: Optional[dict] = None,
-        safe_serialization: Union[bool, Literal["both"]] = False,
+        task_name: str = 'image-classification',
+        safe_serialization: Union[bool, Literal["both"]] = 'both',
 ):
     """
     Arguments:
@@ -294,20 +424,16 @@ def push_to_hf_hub(
             Whether to save the model using `safetensors` or the traditional PyTorch way (that uses `pickle`).
             Can be set to `"both"` in order to push both safe and unsafe weights.
     """
-    # Create repo if it doesn't exist yet
-    repo_url = create_repo(repo_id, token=token, private=private, exist_ok=True)
+    api = HfApi(token=token, library_name="timm", library_version=__version__)
 
-    # Infer complete repo_id from repo_url
+    # Create repo if it doesn't exist yet
+    repo_url = api.create_repo(repo_id, private=private, exist_ok=True)
+
     # Can be different from the input `repo_id` if repo_owner was implicit
-    _, repo_owner, repo_name = repo_type_and_id_from_hf_id(repo_url)
-    repo_id = f"{repo_owner}/{repo_name}"
+    repo_id = repo_url.repo_id
 
     # Check if README file already exist in repo
-    try:
-        get_hf_file_metadata(hf_hub_url(repo_id=repo_id, filename="README.md", revision=revision))
-        has_readme = True
-    except EntryNotFoundError:
-        has_readme = False
+    has_readme = api.file_exists(repo_id=repo_id, filename="README.md", revision=revision)
 
     # Dump model and push to Hub
     with TemporaryDirectory() as tmpdir:
@@ -325,11 +451,11 @@ def push_to_hf_hub(
             model_card = model_card or {}
             model_name = repo_id.split('/')[-1]
             readme_path = Path(tmpdir) / "README.md"
-            readme_text = generate_readme(model_card, model_name)
+            readme_text = generate_readme(model_card, model_name, task_name=task_name)
             readme_path.write_text(readme_text)
 
         # Upload model and return
-        return upload_folder(
+        return api.upload_folder(
             repo_id=repo_id,
             folder_path=tmpdir,
             revision=revision,
@@ -338,11 +464,24 @@ def push_to_hf_hub(
         )
 
 
-def generate_readme(model_card: dict, model_name: str):
+def generate_readme(
+        model_card: dict,
+        model_name: str,
+        task_name: str = 'image-classification',
+):
+    tags = model_card.get('tags', None) or [task_name, 'timm', 'transformers']
     readme_text = "---\n"
-    readme_text += "tags:\n- image-classification\n- timm\n"
-    readme_text += "library_name: timm\n"
+    if tags:
+        readme_text += "tags:\n"
+        for t in tags:
+            readme_text += f"- {t}\n"
+    readme_text += f"pipeline_tag: {task_name}\n"
+    readme_text += f"library_name: {model_card.get('library_name', 'timm')}\n"
     readme_text += f"license: {model_card.get('license', 'apache-2.0')}\n"
+    if 'license_name' in model_card:
+        readme_text += f"license_name: {model_card.get('license_name')}\n"
+    if 'license_link' in model_card:
+        readme_text += f"license_link: {model_card.get('license_link')}\n"
     if 'details' in model_card and 'Dataset' in model_card['details']:
         readme_text += 'datasets:\n'
         if isinstance(model_card['details']['Dataset'], (tuple, list)):
@@ -407,3 +546,56 @@ def _get_safe_alternatives(filename: str) -> Iterable[str]:
         yield HF_OPEN_CLIP_SAFE_WEIGHTS_NAME
     if filename not in (HF_WEIGHTS_NAME, HF_OPEN_CLIP_WEIGHTS_NAME) and filename.endswith(".bin"):
         yield filename[:-4] + ".safetensors"
+
+
+def _get_license_from_hf_hub(model_id: Optional[str], hf_hub_id: Optional[str]) -> Optional[str]:
+    """Retrieve license information for a model from Hugging Face Hub.
+
+    Fetches the license field from the model card metadata on Hugging Face Hub
+    for the specified model. Returns None if the model is not found, if
+    huggingface_hub is not installed, or if the model is marked as "untrained".
+
+    Args:
+        model_id: The model identifier/name. In the case of None we assume an untrained model.
+        hf_hub_id: The Hugging Face Hub organization/user ID. If it is None,
+            we will return None as we cannot infer the license terms.
+
+    Returns:
+        The license string in lowercase if found, None otherwise.
+
+    Note:
+        Requires huggingface_hub package to be installed. Will log a warning
+        and return None if the package is not available.
+    """
+    if not has_hf_hub(True):
+        msg = "For updated license information run `pip install huggingface_hub`."
+        _logger.warning(msg=msg)
+        return None
+
+    if not (model_id and hf_hub_id):
+        return None
+
+    repo_id: str = hf_hub_id + model_id
+
+    try:
+        info = model_info(repo_id=repo_id)
+
+    except RepositoryNotFoundError:
+        msg = f"Repository {repo_id} was not found. Manual inspection of license needed."
+        _logger.warning(msg=msg)
+        return None
+
+    except Exception as _:
+        msg = f"Error for {repo_id}. Manual inspection of license needed."
+        _logger.warning(msg=msg)
+        return None
+
+    license = info.card_data.get("license").lower() if info.card_data else None
+
+    if license == 'other':
+        name = info.card_data.get("license_name", None)
+
+        if name is not None:
+            return name
+
+    return license

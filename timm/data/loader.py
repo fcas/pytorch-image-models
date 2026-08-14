@@ -10,7 +10,7 @@ import random
 from contextlib import suppress
 from functools import partial
 from itertools import repeat
-from typing import Callable, Optional, Tuple, Union
+from typing import Callable, Optional, Sequence, Tuple, Union
 
 import torch
 import torch.utils.data
@@ -21,6 +21,7 @@ from .dataset import IterableImageDataset, ImageDataset
 from .distributed_sampler import OrderedDistributedSampler, RepeatAugSampler
 from .random_erasing import RandomErasing
 from .mixup import FastCollateMixup
+from .scheduled_sampler import ScheduledBatchSampler, ScheduledTransformDataset
 from .transforms_factory import create_transform
 
 _logger = logging.getLogger(__name__)
@@ -33,6 +34,7 @@ def fast_collate(batch):
     if isinstance(batch[0][0], tuple):
         # This branch 'deinterleaves' and flattens tuples of input tensors into one tensor ordered by position
         # such that all tuple of position n will end up in a torch.split(tensor, batch_size) in nth position
+        is_np = isinstance(batch[0][0], np.ndarray)
         inner_tuple_size = len(batch[0][0])
         flattened_batch_size = batch_size * inner_tuple_size
         targets = torch.zeros(flattened_batch_size, dtype=torch.int64)
@@ -41,7 +43,10 @@ def fast_collate(batch):
             assert len(batch[i][0]) == inner_tuple_size  # all input tensor tuples must be same length
             for j in range(inner_tuple_size):
                 targets[i + j * batch_size] = batch[i][1]
-                tensor[i + j * batch_size] += torch.from_numpy(batch[i][0][j])
+                if is_np:
+                    tensor[i + j * batch_size] += torch.from_numpy(batch[i][0][j])
+                else:
+                    tensor[i + j * batch_size] += batch[i][0][j]
         return tensor, targets
     elif isinstance(batch[0][0], np.ndarray):
         targets = torch.tensor([b[1] for b in batch], dtype=torch.int64)
@@ -77,18 +82,18 @@ class PrefetchLoader:
 
     def __init__(
             self,
-            loader,
-            mean=IMAGENET_DEFAULT_MEAN,
-            std=IMAGENET_DEFAULT_STD,
-            channels=3,
-            device=torch.device('cuda'),
-            img_dtype=torch.float32,
-            fp16=False,
-            re_prob=0.,
-            re_mode='const',
-            re_count=1,
-            re_num_splits=0):
-
+            loader: torch.utils.data.DataLoader,
+            mean: Tuple[float, ...] = IMAGENET_DEFAULT_MEAN,
+            std: Tuple[float, ...] = IMAGENET_DEFAULT_STD,
+            channels: int = 3,
+            device: torch.device = torch.device('cuda'),
+            img_dtype: Optional[torch.dtype] = None,
+            fp16: bool = False,
+            re_prob: float = 0.,
+            re_mode: str = 'const',
+            re_count: int = 1,
+            re_num_splits: int = 0,
+    ):
         mean = adapt_to_chs(mean, channels)
         std = adapt_to_chs(std, channels)
         normalization_shape = (1, channels, 1, 1)
@@ -98,7 +103,7 @@ class PrefetchLoader:
         if fp16:
             # fp16 arg is deprecated, but will override dtype arg if set for bwd compat
             img_dtype = torch.float16
-        self.img_dtype = img_dtype
+        self.img_dtype = img_dtype or torch.float32
         self.mean = torch.tensor(
             [x * 255 for x in mean], device=device, dtype=img_dtype).view(normalization_shape)
         self.std = torch.tensor(
@@ -113,13 +118,17 @@ class PrefetchLoader:
             )
         else:
             self.random_erasing = None
-        self.is_cuda = torch.cuda.is_available() and device.type == 'cuda'
+        self.is_cuda = device.type == 'cuda' and torch.cuda.is_available()
+        self.is_npu = device.type == 'npu' and torch.npu.is_available()
 
     def __iter__(self):
         first = True
         if self.is_cuda:
-            stream = torch.cuda.Stream()
+            stream = torch.cuda.Stream(device=self.device)
             stream_context = partial(torch.cuda.stream, stream=stream)
+        elif self.is_npu:
+            stream = torch.npu.Stream(device=self.device)
+            stream_context = partial(torch.npu.stream, stream=stream)
         else:
             stream = None
             stream_context = suppress
@@ -139,7 +148,10 @@ class PrefetchLoader:
                 first = False
 
             if stream is not None:
-                torch.cuda.current_stream().wait_stream(stream)
+                if self.is_cuda:
+                    torch.cuda.current_stream(device=self.device).wait_stream(stream)
+                elif self.is_npu:
+                    torch.npu.current_stream(device=self.device).wait_stream(stream)
 
             input = next_input
             target = next_target
@@ -152,6 +164,10 @@ class PrefetchLoader:
     @property
     def sampler(self):
         return self.loader.sampler
+
+    @property
+    def batch_sampler(self):
+        return self.loader.batch_sampler
 
     @property
     def dataset(self):
@@ -226,6 +242,15 @@ def create_loader(
         persistent_workers: bool = True,
         worker_seeding: str = 'all',
         tf_preprocessing: bool = False,
+        input_size_choices: Optional[Sequence[Union[int, Tuple[int, int], Tuple[int, int, int]]]] = None,
+        batch_size_choices: Optional[Sequence[int]] = None,
+        batch_choice_weights: Optional[Sequence[float]] = None,
+        batch_choice_seed: int = 0,
+        batch_choice_schedule: str = 'constant',
+        batch_schedule_epochs: Optional[int] = None,
+        batch_schedule_spread: float = 0.65,
+        batch_schedule_random_mix: float = 0.1,
+        num_batches: Optional[int] = None,
 ):
     """
 
@@ -269,6 +294,18 @@ def create_loader(
         persistent_workers: Enable persistent worker processes.
         worker_seeding: Control worker random seeding at init.
         tf_preprocessing: Use TF 1.0 inference preprocessing for testing model ports.
+        input_size_choices: Per-batch input size choices for scheduled resolution training.
+        batch_size_choices: Batch size corresponding to each input size choice. Uses ``batch_size`` for all
+            choices when not specified.
+        batch_choice_weights: Sampling weights for input size choices. Uniform when not specified.
+        batch_choice_seed: Random seed used to create and shuffle the batch schedule.
+        batch_choice_schedule: Choice schedule mode, either ``constant`` or ``progressive``.
+        batch_schedule_epochs: Number of epochs over which a progressive schedule moves through its choices.
+        batch_schedule_spread: Standard deviation of the progressive choice window, in choice-index units.
+        batch_schedule_random_mix: Fraction of uniform random exploration over nonzero-weight choices in a
+            progressive schedule.
+        num_batches: Fixed number of loader batches per epoch. Inferred from the schedule-average batch size
+            for progressive schedules when not specified.
 
     Returns:
         DataLoader
@@ -277,8 +314,7 @@ def create_loader(
     if re_split:
         # apply RE to second half of batch if no aug split otherwise line up with aug split
         re_num_splits = num_aug_splits or 2
-    dataset.transform = create_transform(
-        input_size,
+    transform_kwargs = dict(
         is_training=is_training,
         no_aug=no_aug,
         train_crop_mode=train_crop_mode,
@@ -305,6 +341,53 @@ def create_loader(
         use_prefetcher=use_prefetcher,
         separate=num_aug_splits > 0,
     )
+    channels = (
+        input_size[0]
+        if isinstance(input_size, (tuple, list)) and len(input_size) == 3
+        else len(mean)
+    )
+
+    scheduled_batching = input_size_choices is not None
+    if scheduled_batching:
+        if not is_training:
+            raise ValueError('Scheduled input sizes are only supported for training loaders.')
+        if use_multi_epochs_loader:
+            raise ValueError('MultiEpochsDataLoader is not supported with scheduled input sizes.')
+        if isinstance(dataset, torch.utils.data.IterableDataset):
+            raise TypeError('Scheduled input sizes require a map-style dataset.')
+        if num_aug_splits > 0:
+            raise ValueError('Augmentation splits are not supported with scheduled input sizes.')
+        if not input_size_choices:
+            raise ValueError('input_size_choices must contain at least one size.')
+
+        resolved_input_sizes = []
+        for size in input_size_choices:
+            if isinstance(size, int):
+                size = (channels, size, size)
+            elif len(size) == 2:
+                size = (channels, *size)
+            elif len(size) == 3:
+                size = tuple(size)
+                if size[0] != channels:
+                    raise ValueError('All scheduled input sizes must use the same number of channels.')
+            else:
+                raise ValueError('Scheduled input sizes must be scalars, HW tuples, or CHW tuples.')
+            if any(dimension <= 0 for dimension in size):
+                raise ValueError('All scheduled input size dimensions must be positive.')
+            resolved_input_sizes.append(size)
+
+        if batch_size_choices is None:
+            batch_size_choices = [batch_size] * len(resolved_input_sizes)
+        elif len(batch_size_choices) != len(resolved_input_sizes):
+            raise ValueError('batch_size_choices and input_size_choices must have the same length.')
+        if batch_choice_weights is not None and len(batch_choice_weights) != len(resolved_input_sizes):
+            raise ValueError('batch_choice_weights and input_size_choices must have the same length.')
+
+        transforms = [create_transform(size, **transform_kwargs) for size in resolved_input_sizes]
+        dataset.transform = None
+        dataset = ScheduledTransformDataset(dataset, transforms)
+    else:
+        dataset.transform = create_transform(input_size, **transform_kwargs)
 
     if isinstance(dataset, IterableImageDataset):
         # give Iterable datasets early knowledge of num_workers so that sample estimates
@@ -325,6 +408,9 @@ def create_loader(
     else:
         assert num_aug_repeats == 0, "RepeatAugment not currently supported in non-distributed or IterableDataset use"
 
+    if scheduled_batching and sampler is None:
+        sampler = torch.utils.data.RandomSampler(dataset)
+
     if collate_fn is None:
         collate_fn = fast_collate if use_prefetcher else torch.utils.data.dataloader.default_collate
 
@@ -333,16 +419,32 @@ def create_loader(
         loader_class = MultiEpochsDataLoader
 
     loader_args = dict(
-        batch_size=batch_size,
-        shuffle=not isinstance(dataset, torch.utils.data.IterableDataset) and sampler is None and is_training,
         num_workers=num_workers,
-        sampler=sampler,
         collate_fn=collate_fn,
         pin_memory=pin_memory,
-        drop_last=is_training,
         worker_init_fn=partial(_worker_init, worker_seeding=worker_seeding),
         persistent_workers=persistent_workers
     )
+    if scheduled_batching:
+        loader_args['batch_sampler'] = ScheduledBatchSampler(
+            sampler,
+            batch_sizes=batch_size_choices,
+            choice_weights=batch_choice_weights,
+            seed=batch_choice_seed,
+            drop_last=is_training,
+            num_batches=num_batches,
+            choice_schedule=batch_choice_schedule,
+            schedule_epochs=batch_schedule_epochs,
+            schedule_spread=batch_schedule_spread,
+            schedule_random_mix=batch_schedule_random_mix,
+        )
+    else:
+        loader_args.update(
+            batch_size=batch_size,
+            shuffle=not isinstance(dataset, torch.utils.data.IterableDataset) and sampler is None and is_training,
+            sampler=sampler,
+            drop_last=is_training,
+        )
     try:
         loader = loader_class(dataset, **loader_args)
     except TypeError as e:
@@ -354,7 +456,7 @@ def create_loader(
             loader,
             mean=mean,
             std=std,
-            channels=input_size[0],
+            channels=channels,
             device=device,
             fp16=fp16,  # deprecated, use img_dtype
             img_dtype=img_dtype,

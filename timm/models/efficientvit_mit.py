@@ -6,8 +6,8 @@ Paper: `Efficientvit: Enhanced linear attention for high-resolution low-computat
 Adapted from official impl at https://github.com/mit-han-lab/efficientvit
 """
 
-__all__ = ['EfficientVit']
-from typing import Optional
+__all__ = ['EfficientVit', 'EfficientVitLarge']
+from typing import List, Optional, Tuple, Type, Union
 from functools import partial
 
 import torch
@@ -17,6 +17,7 @@ import torch.nn.functional as F
 from timm.data import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
 from timm.layers import SelectAdaptivePool2d, create_conv2d, GELUTanh
 from ._builder import build_model_with_cfg
+from ._features import feature_take_indices
 from ._features_fx import register_notrace_module
 from ._manipulate import checkpoint_seq
 from ._registry import register_model, generate_default_cfgs
@@ -47,19 +48,22 @@ def get_same_padding(kernel_size: int or tuple[int, ...]) -> int or tuple[int, .
 
 class ConvNormAct(nn.Module):
     def __init__(
-        self,
-        in_channels: int,
-        out_channels: int,
-        kernel_size=3,
-        stride=1,
-        dilation=1,
-        groups=1,
-        bias=False,
-        dropout=0.,
-        norm_layer=nn.BatchNorm2d,
-        act_layer=nn.ReLU,
+            self,
+            in_channels: int,
+            out_channels: int,
+            kernel_size: Union[int, Tuple[int, int]] = 3,
+            stride: int = 1,
+            dilation: int = 1,
+            groups: int = 1,
+            bias: bool = False,
+            dropout: float = 0.,
+            norm_layer: Optional[Type[nn.Module]] = nn.BatchNorm2d,
+            act_layer: Optional[Type[nn.Module]] = nn.ReLU,
+            device=None,
+            dtype=None,
     ):
-        super(ConvNormAct, self).__init__()
+        dd = {'device': device, 'dtype': dtype}
+        super().__init__()
         self.dropout = nn.Dropout(dropout, inplace=False)
         self.conv = create_conv2d(
             in_channels,
@@ -69,8 +73,9 @@ class ConvNormAct(nn.Module):
             dilation=dilation,
             groups=groups,
             bias=bias,
+            **dd,
         )
-        self.norm = norm_layer(num_features=out_channels) if norm_layer else nn.Identity()
+        self.norm = norm_layer(num_features=out_channels, **dd) if norm_layer else nn.Identity()
         self.act = act_layer(inplace=True) if act_layer is not None else nn.Identity()
 
     def forward(self, x):
@@ -83,16 +88,19 @@ class ConvNormAct(nn.Module):
 
 class DSConv(nn.Module):
     def __init__(
-        self,
-        in_channels: int,
-        out_channels: int,
-        kernel_size=3,
-        stride=1,
-        use_bias=False,
-        norm_layer=(nn.BatchNorm2d, nn.BatchNorm2d),
-        act_layer=(nn.ReLU6, None),
+            self,
+            in_channels: int,
+            out_channels: int,
+            kernel_size: int = 3,
+            stride: int = 1,
+            use_bias: Union[bool, Tuple[bool, bool]] = False,
+            norm_layer: Union[Type[nn.Module], Tuple[Optional[Type[nn.Module]], ...]] = nn.BatchNorm2d,
+            act_layer: Union[Type[nn.Module], Tuple[Optional[Type[nn.Module]], ...]] = (nn.ReLU6, None),
+            device=None,
+            dtype=None,
     ):
-        super(DSConv, self).__init__()
+        dd = {'device': device, 'dtype': dtype}
+        super().__init__()
         use_bias = val2tuple(use_bias, 2)
         norm_layer = val2tuple(norm_layer, 2)
         act_layer = val2tuple(act_layer, 2)
@@ -106,6 +114,7 @@ class DSConv(nn.Module):
             norm_layer=norm_layer[0],
             act_layer=act_layer[0],
             bias=use_bias[0],
+            **dd,
         )
         self.point_conv = ConvNormAct(
             in_channels,
@@ -114,6 +123,7 @@ class DSConv(nn.Module):
             norm_layer=norm_layer[1],
             act_layer=act_layer[1],
             bias=use_bias[1],
+            **dd,
         )
 
     def forward(self, x):
@@ -125,17 +135,20 @@ class DSConv(nn.Module):
 class ConvBlock(nn.Module):
     def __init__(
         self,
-        in_channels: int,
-        out_channels: int,
-        kernel_size=3,
-        stride=1,
-        mid_channels=None,
-        expand_ratio=1,
-        use_bias=False,
-        norm_layer=(nn.BatchNorm2d, nn.BatchNorm2d),
-        act_layer=(nn.ReLU6, None),
+            in_channels: int,
+            out_channels: int,
+            kernel_size: int = 3,
+            stride: int = 1,
+            mid_channels: Optional[int] = None,
+            expand_ratio: float = 1,
+            use_bias: Union[bool, Tuple[bool, bool]] = False,
+            norm_layer: Union[Type[nn.Module], Tuple[Optional[Type[nn.Module]], ...]] = nn.BatchNorm2d,
+            act_layer: Union[Type[nn.Module], Tuple[Optional[Type[nn.Module]], ...]] = (nn.ReLU6, None),
+            device=None,
+            dtype=None,
     ):
-        super(ConvBlock, self).__init__()
+        dd = {'device': device, 'dtype': dtype}
+        super().__init__()
         use_bias = val2tuple(use_bias, 2)
         norm_layer = val2tuple(norm_layer, 2)
         act_layer = val2tuple(act_layer, 2)
@@ -149,6 +162,7 @@ class ConvBlock(nn.Module):
             norm_layer=norm_layer[0],
             act_layer=act_layer[0],
             bias=use_bias[0],
+            **dd,
         )
         self.conv2 = ConvNormAct(
             mid_channels,
@@ -158,6 +172,7 @@ class ConvBlock(nn.Module):
             norm_layer=norm_layer[1],
             act_layer=act_layer[1],
             bias=use_bias[1],
+            **dd,
         )
 
     def forward(self, x):
@@ -168,18 +183,21 @@ class ConvBlock(nn.Module):
 
 class MBConv(nn.Module):
     def __init__(
-        self,
-        in_channels: int,
-        out_channels: int,
-        kernel_size=3,
-        stride=1,
-        mid_channels=None,
-        expand_ratio=6,
-        use_bias=False,
-        norm_layer=(nn.BatchNorm2d, nn.BatchNorm2d, nn.BatchNorm2d),
-        act_layer=(nn.ReLU6, nn.ReLU6, None),
+            self,
+            in_channels: int,
+            out_channels: int,
+            kernel_size: int = 3,
+            stride: int = 1,
+            mid_channels: Optional[int] = None,
+            expand_ratio: float = 6,
+            use_bias: Union[bool, Tuple[bool, ...]] = False,
+            norm_layer: Union[Type[nn.Module], Tuple[Optional[Type[nn.Module]], ...]] = nn.BatchNorm2d,
+            act_layer: Union[Type[nn.Module], Tuple[Optional[Type[nn.Module]], ...]] = (nn.ReLU6, nn.ReLU6, None),
+            device=None,
+            dtype=None,
     ):
-        super(MBConv, self).__init__()
+        dd = {'device': device, 'dtype': dtype}
+        super().__init__()
         use_bias = val2tuple(use_bias, 3)
         norm_layer = val2tuple(norm_layer, 3)
         act_layer = val2tuple(act_layer, 3)
@@ -193,6 +211,7 @@ class MBConv(nn.Module):
             norm_layer=norm_layer[0],
             act_layer=act_layer[0],
             bias=use_bias[0],
+            **dd,
         )
         self.depth_conv = ConvNormAct(
             mid_channels,
@@ -203,6 +222,7 @@ class MBConv(nn.Module):
             norm_layer=norm_layer[1],
             act_layer=act_layer[1],
             bias=use_bias[1],
+            **dd,
         )
         self.point_conv = ConvNormAct(
             mid_channels,
@@ -211,6 +231,7 @@ class MBConv(nn.Module):
             norm_layer=norm_layer[2],
             act_layer=act_layer[2],
             bias=use_bias[2],
+            **dd,
         )
 
     def forward(self, x):
@@ -222,19 +243,22 @@ class MBConv(nn.Module):
 
 class FusedMBConv(nn.Module):
     def __init__(
-        self,
-        in_channels: int,
-        out_channels: int,
-        kernel_size=3,
-        stride=1,
-        mid_channels=None,
-        expand_ratio=6,
-        groups=1,
-        use_bias=False,
-        norm_layer=(nn.BatchNorm2d, nn.BatchNorm2d),
-        act_layer=(nn.ReLU6, None),
+            self,
+            in_channels: int,
+            out_channels: int,
+            kernel_size: int = 3,
+            stride: int = 1,
+            mid_channels: Optional[int] = None,
+            expand_ratio: float = 6,
+            groups: int = 1,
+            use_bias: Union[bool, Tuple[bool, ...]] = False,
+            norm_layer: Union[Type[nn.Module], Tuple[Optional[Type[nn.Module]], ...]] = nn.BatchNorm2d,
+            act_layer: Union[Type[nn.Module], Tuple[Optional[Type[nn.Module]], ...]] = (nn.ReLU6, None),
+            device=None,
+            dtype=None,
     ):
-        super(FusedMBConv, self).__init__()
+        dd = {'device': device, 'dtype': dtype}
+        super().__init__()
         use_bias = val2tuple(use_bias, 2)
         norm_layer = val2tuple(norm_layer, 2)
         act_layer = val2tuple(act_layer, 2)
@@ -249,6 +273,7 @@ class FusedMBConv(nn.Module):
             norm_layer=norm_layer[0],
             act_layer=act_layer[0],
             bias=use_bias[0],
+            **dd,
         )
         self.point_conv = ConvNormAct(
             mid_channels,
@@ -257,6 +282,7 @@ class FusedMBConv(nn.Module):
             norm_layer=norm_layer[1],
             act_layer=act_layer[1],
             bias=use_bias[1],
+            **dd,
         )
 
     def forward(self, x):
@@ -269,20 +295,23 @@ class LiteMLA(nn.Module):
     """Lightweight multi-scale linear attention"""
 
     def __init__(
-        self,
-        in_channels: int,
-        out_channels: int,
-        heads: int or None = None,
-        heads_ratio: float = 1.0,
-        dim=8,
-        use_bias=False,
-        norm_layer=(None, nn.BatchNorm2d),
-        act_layer=(None, None),
-        kernel_func=nn.ReLU,
-        scales=(5,),
-        eps=1e-5,
+            self,
+            in_channels: int,
+            out_channels: int,
+            heads: Optional[int] = None,
+            heads_ratio: float = 1.0,
+            dim: int = 8,
+            use_bias: Union[bool, Tuple[bool, ...]] = False,
+            norm_layer: Union[Type[nn.Module], Tuple[Optional[Type[nn.Module]], ...]] = (None, nn.BatchNorm2d),
+            act_layer: Union[Type[nn.Module], Tuple[Optional[Type[nn.Module]], ...]] = (None, None),
+            kernel_func: Type[nn.Module] = nn.ReLU,
+            scales: Tuple[int, ...] = (5,),
+            eps: float = 1e-5,
+            device=None,
+            dtype=None,
     ):
-        super(LiteMLA, self).__init__()
+        dd = {'device': device, 'dtype': dtype}
+        super().__init__()
         self.eps = eps
         heads = heads or int(in_channels // dim * heads_ratio)
         total_dim = heads * dim
@@ -298,6 +327,7 @@ class LiteMLA(nn.Module):
             bias=use_bias[0],
             norm_layer=norm_layer[0],
             act_layer=act_layer[0],
+            **dd,
         )
         self.aggreg = nn.ModuleList([
             nn.Sequential(
@@ -308,8 +338,9 @@ class LiteMLA(nn.Module):
                     padding=get_same_padding(scale),
                     groups=3 * total_dim,
                     bias=use_bias[0],
+                    **dd,
                 ),
-                nn.Conv2d(3 * total_dim, 3 * total_dim, 1, groups=3 * heads, bias=use_bias[0]),
+                nn.Conv2d(3 * total_dim, 3 * total_dim, 1, groups=3 * heads, bias=use_bias[0], **dd),
             )
             for scale in scales
         ])
@@ -322,6 +353,7 @@ class LiteMLA(nn.Module):
             bias=use_bias[1],
             norm_layer=norm_layer[1],
             act_layer=act_layer[1],
+            **dd,
         )
 
     def _attn(self, q, k, v):
@@ -366,15 +398,18 @@ register_notrace_module(LiteMLA)
 
 class EfficientVitBlock(nn.Module):
     def __init__(
-        self,
-        in_channels,
-        heads_ratio=1.0,
-        head_dim=32,
-        expand_ratio=4,
-        norm_layer=nn.BatchNorm2d,
-        act_layer=nn.Hardswish,
+            self,
+            in_channels: int,
+            heads_ratio: float = 1.0,
+            head_dim: int = 32,
+            expand_ratio: float = 4,
+            norm_layer: Type[nn.Module] = nn.BatchNorm2d,
+            act_layer: Type[nn.Module] = nn.Hardswish,
+            device=None,
+            dtype=None,
     ):
-        super(EfficientVitBlock, self).__init__()
+        dd = {'device': device, 'dtype': dtype}
+        super().__init__()
         self.context_module = ResidualBlock(
             LiteMLA(
                 in_channels=in_channels,
@@ -382,6 +417,7 @@ class EfficientVitBlock(nn.Module):
                 heads_ratio=heads_ratio,
                 dim=head_dim,
                 norm_layer=(None, norm_layer),
+                **dd,
             ),
             nn.Identity(),
         )
@@ -393,6 +429,7 @@ class EfficientVitBlock(nn.Module):
                 use_bias=(True, True, False),
                 norm_layer=(None, None, norm_layer),
                 act_layer=(act_layer, act_layer, None),
+                **dd,
             ),
             nn.Identity(),
         )
@@ -405,12 +442,12 @@ class EfficientVitBlock(nn.Module):
 
 class ResidualBlock(nn.Module):
     def __init__(
-        self,
-        main: Optional[nn.Module],
-        shortcut: Optional[nn.Module] = None,
-        pre_norm: Optional[nn.Module] = None,
+            self,
+            main: Optional[nn.Module],
+            shortcut: Optional[nn.Module] = None,
+            pre_norm: Optional[nn.Module] = None,
     ):
-        super(ResidualBlock, self).__init__()
+        super().__init__()
         self.pre_norm = pre_norm if pre_norm is not None else nn.Identity()
         self.main = main
         self.shortcut = shortcut
@@ -422,7 +459,7 @@ class ResidualBlock(nn.Module):
         return res
 
 
-def build_local_block(        
+def build_local_block(
         in_channels: int,
         out_channels: int,
         stride: int,
@@ -431,7 +468,10 @@ def build_local_block(
         act_layer: str,
         fewer_norm: bool = False,
         block_type: str = "default",
+        device=None,
+        dtype=None,
 ):
+    dd = {'device': device, 'dtype': dtype}
     assert block_type in ["default", "large", "fused"]
     if expand_ratio == 1:
         if block_type == "default":
@@ -442,6 +482,7 @@ def build_local_block(
                 use_bias=(True, False) if fewer_norm else False,
                 norm_layer=(None, norm_layer) if fewer_norm else norm_layer,
                 act_layer=(act_layer, None),
+                **dd,
             )
         else:
             block = ConvBlock(
@@ -451,6 +492,7 @@ def build_local_block(
                 use_bias=(True, False) if fewer_norm else False,
                 norm_layer=(None, norm_layer) if fewer_norm else norm_layer,
                 act_layer=(act_layer, None),
+                **dd,
             )
     else:
         if block_type == "default":
@@ -462,6 +504,7 @@ def build_local_block(
                 use_bias=(True, True, False) if fewer_norm else False,
                 norm_layer=(None, None, norm_layer) if fewer_norm else norm_layer,
                 act_layer=(act_layer, act_layer, None),
+                **dd,
             )
         else:
             block = FusedMBConv(
@@ -472,20 +515,37 @@ def build_local_block(
                 use_bias=(True, False) if fewer_norm else False,
                 norm_layer=(None, norm_layer) if fewer_norm else norm_layer,
                 act_layer=(act_layer, None),
+                **dd,
             )
     return block
 
 
 class Stem(nn.Sequential):
-    def __init__(self, in_chs, out_chs, depth, norm_layer, act_layer, block_type='default'):
+    def __init__(
+            self,
+            in_chs: int,
+            out_chs: int,
+            depth: int,
+            norm_layer: Type[nn.Module],
+            act_layer: Type[nn.Module],
+            block_type: str = 'default',
+            device=None,
+            dtype=None,
+    ):
         super().__init__()
+        dd = {'device': device, 'dtype': dtype}
         self.stride = 2
 
         self.add_module(
             'in_conv',
             ConvNormAct(
-                in_chs, out_chs,
-                kernel_size=3, stride=2, norm_layer=norm_layer, act_layer=act_layer,
+                in_chs,
+                out_chs,
+                kernel_size=3,
+                stride=2,
+                norm_layer=norm_layer,
+                act_layer=act_layer,
+                **dd,
             )
         )
         stem_block = 0
@@ -499,6 +559,7 @@ class Stem(nn.Sequential):
                     norm_layer=norm_layer,
                     act_layer=act_layer,
                     block_type=block_type,
+                    **dd,
                 ),
                 nn.Identity(),
             ))
@@ -508,16 +569,19 @@ class Stem(nn.Sequential):
 class EfficientVitStage(nn.Module):
     def __init__(
             self,
-            in_chs,
-            out_chs,
-            depth,
-            norm_layer,
-            act_layer,
-            expand_ratio,
-            head_dim,
-            vit_stage=False,
+            in_chs: int,
+            out_chs: int,
+            depth: int,
+            norm_layer: Type[nn.Module],
+            act_layer: Type[nn.Module],
+            expand_ratio: float,
+            head_dim: int,
+            vit_stage: bool = False,
+            device=None,
+            dtype=None,
     ):
-        super(EfficientVitStage, self).__init__()
+        dd = {'device': device, 'dtype': dtype}
+        super().__init__()
         blocks = [ResidualBlock(
             build_local_block(
                 in_channels=in_chs,
@@ -527,6 +591,7 @@ class EfficientVitStage(nn.Module):
                 norm_layer=norm_layer,
                 act_layer=act_layer,
                 fewer_norm=vit_stage,
+                **dd,
             ),
             None,
         )]
@@ -542,6 +607,7 @@ class EfficientVitStage(nn.Module):
                         expand_ratio=expand_ratio,
                         norm_layer=norm_layer,
                         act_layer=act_layer,
+                        **dd,
                     )
                 )
         else:
@@ -554,7 +620,8 @@ class EfficientVitStage(nn.Module):
                         stride=1,
                         expand_ratio=expand_ratio,
                         norm_layer=norm_layer,
-                        act_layer=act_layer
+                        act_layer=act_layer,
+                        **dd,
                     ),
                     nn.Identity(),
                 ))
@@ -568,16 +635,19 @@ class EfficientVitStage(nn.Module):
 class EfficientVitLargeStage(nn.Module):
     def __init__(
             self,
-            in_chs,
-            out_chs,
-            depth,
-            norm_layer,
-            act_layer,
-            head_dim,
-            vit_stage=False,
-            fewer_norm=False,
+            in_chs: int,
+            out_chs: int,
+            depth: int,
+            norm_layer: Type[nn.Module],
+            act_layer: Type[nn.Module],
+            head_dim: int,
+            vit_stage: bool = False,
+            fewer_norm: bool = False,
+            device=None,
+            dtype=None,
     ):
-        super(EfficientVitLargeStage, self).__init__()
+        dd = {'device': device, 'dtype': dtype}
+        super().__init__()
         blocks = [ResidualBlock(
             build_local_block(
                 in_channels=in_chs,
@@ -588,6 +658,7 @@ class EfficientVitLargeStage(nn.Module):
                 act_layer=act_layer,
                 fewer_norm=vit_stage or fewer_norm,
                 block_type='default' if fewer_norm else 'fused',
+                **dd,
             ),
             None,
         )]
@@ -603,6 +674,7 @@ class EfficientVitLargeStage(nn.Module):
                         expand_ratio=6,
                         norm_layer=norm_layer,
                         act_layer=act_layer,
+                        **dd,
                     )
                 )
         else:
@@ -618,6 +690,7 @@ class EfficientVitLargeStage(nn.Module):
                         act_layer=act_layer,
                         fewer_norm=fewer_norm,
                         block_type='default' if fewer_norm else 'fused',
+                        **dd,
                     ),
                     nn.Identity(),
                 ))
@@ -630,58 +703,83 @@ class EfficientVitLargeStage(nn.Module):
 
 class ClassifierHead(nn.Module):
     def __init__(
-        self,
-        in_channels,
-        widths,
-        n_classes=1000,
-        dropout=0.,
-        norm_layer=nn.BatchNorm2d,
-        act_layer=nn.Hardswish,
-        global_pool='avg',
-        norm_eps=1e-5,
+            self,
+            in_channels: int,
+            widths: List[int],
+            num_classes: int = 1000,
+            dropout: float = 0.,
+            norm_layer: Type[nn.Module] = nn.BatchNorm2d,
+            act_layer: Optional[Type[nn.Module]] = nn.Hardswish,
+            pool_type: str = 'avg',
+            norm_eps: float = 1e-5,
+            device=None,
+            dtype=None,
     ):
-        super(ClassifierHead, self).__init__()
-        self.in_conv = ConvNormAct(in_channels, widths[0], 1, norm_layer=norm_layer, act_layer=act_layer)
-        self.global_pool = SelectAdaptivePool2d(pool_type=global_pool, flatten=True, input_fmt='NCHW')
+        dd = {'device': device, 'dtype': dtype}
+        super().__init__()
+        self.widths = widths
+        self.num_features = widths[-1]
+
+        assert pool_type, 'Cannot disable pooling'
+        self.in_conv = ConvNormAct(in_channels, widths[0], 1, norm_layer=norm_layer, act_layer=act_layer, **dd)
+        self.global_pool = SelectAdaptivePool2d(pool_type=pool_type, flatten=True)
         self.classifier = nn.Sequential(
-            nn.Linear(widths[0], widths[1], bias=False),
-            nn.LayerNorm(widths[1], eps=norm_eps),
+            nn.Linear(widths[0], widths[1], bias=False, **dd),
+            nn.LayerNorm(widths[1], eps=norm_eps, **dd),
             act_layer(inplace=True) if act_layer is not None else nn.Identity(),
             nn.Dropout(dropout, inplace=False),
-            nn.Linear(widths[1], n_classes, bias=True),
+            nn.Linear(widths[1], num_classes, bias=True, **dd) if num_classes > 0 else nn.Identity(),
         )
+
+    def reset(self, num_classes: int, pool_type: Optional[str] = None):
+        if pool_type is not None:
+            assert pool_type, 'Cannot disable pooling'
+            self.global_pool = SelectAdaptivePool2d(pool_type=pool_type, flatten=True,)
+        if num_classes > 0:
+            self.classifier[-1] = nn.Linear(self.num_features, num_classes, bias=True)
+        else:
+            self.classifier[-1] = nn.Identity()
 
     def forward(self, x, pre_logits: bool = False):
         x = self.in_conv(x)
         x = self.global_pool(x)
         if pre_logits:
-            return x
-        x = self.classifier(x)
+            # cannot slice or iterate with torchscript so, this
+            x = self.classifier[0](x)
+            x = self.classifier[1](x)
+            x = self.classifier[2](x)
+            x = self.classifier[3](x)
+        else:
+            x = self.classifier(x)
         return x
 
 
 class EfficientVit(nn.Module):
     def __init__(
-        self,
-        in_chans=3,
-        widths=(),
-        depths=(),
-        head_dim=32,
-        expand_ratio=4,
-        norm_layer=nn.BatchNorm2d,
-        act_layer=nn.Hardswish,
-        global_pool='avg',
-        head_widths=(),
-        drop_rate=0.0,
-        num_classes=1000,
+            self,
+            in_chans: int = 3,
+            widths: Tuple[int, ...] = (),
+            depths: Tuple[int, ...] = (),
+            head_dim: int = 32,
+            expand_ratio: float = 4,
+            norm_layer: Type[nn.Module] = nn.BatchNorm2d,
+            act_layer: Type[nn.Module] = nn.Hardswish,
+            global_pool: str = 'avg',
+            head_widths: Tuple[int, ...] = (),
+            drop_rate: float = 0.0,
+            num_classes: int = 1000,
+            device=None,
+            dtype=None,
     ):
-        super(EfficientVit, self).__init__()
+        dd = {'device': device, 'dtype': dtype}
+        super().__init__()
         self.grad_checkpointing = False
         self.global_pool = global_pool
         self.num_classes = num_classes
+        self.in_chans = in_chans
 
         # input stem
-        self.stem = Stem(in_chans, widths[0], depths[0], norm_layer, act_layer)
+        self.stem = Stem(in_chans, widths[0], depths[0], norm_layer, act_layer, **dd)
         stride = self.stem.stride
 
         # stages
@@ -698,27 +796,22 @@ class EfficientVit(nn.Module):
                 expand_ratio=expand_ratio,
                 head_dim=head_dim,
                 vit_stage=i >= 2,
+                **dd,
             ))
             stride *= 2
             in_channels = w
             self.feature_info += [dict(num_chs=in_channels, reduction=stride, module=f'stages.{i}')]
 
         self.num_features = in_channels
-        self.head_widths = head_widths
-        self.head_dropout = drop_rate
-        if num_classes > 0:
-            self.head = ClassifierHead(
-                self.num_features,
-                self.head_widths,
-                n_classes=num_classes,
-                dropout=self.head_dropout,
-                global_pool=self.global_pool,
-            )
-        else:
-            if self.global_pool == 'avg':
-                self.head = SelectAdaptivePool2d(pool_type=global_pool, flatten=True)
-            else:
-                self.head = nn.Identity()
+        self.head = ClassifierHead(
+            self.num_features,
+            widths=head_widths,
+            num_classes=num_classes,
+            dropout=drop_rate,
+            pool_type=self.global_pool,
+            **dd,
+        )
+        self.head_hidden_size = self.head.num_features
 
     @torch.jit.ignore
     def group_matcher(self, coarse=False):
@@ -736,26 +829,72 @@ class EfficientVit(nn.Module):
         self.grad_checkpointing = enable
 
     @torch.jit.ignore
-    def get_classifier(self):
+    def get_classifier(self) -> nn.Module:
         return self.head.classifier[-1]
 
     def reset_classifier(self, num_classes: int, global_pool: Optional[str] = None):
         self.num_classes = num_classes
-        if global_pool is not None:
-            self.global_pool = global_pool
-        if num_classes > 0:
-            self.head = ClassifierHead(
-                self.num_features,
-                self.head_widths,
-                n_classes=num_classes,
-                dropout=self.head_dropout,
-                global_pool=self.global_pool,
-            )
+        self.head.reset(num_classes, global_pool)
+
+    def forward_intermediates(
+            self,
+            x: torch.Tensor,
+            indices: Optional[Union[int, List[int]]] = None,
+            norm: bool = False,
+            stop_early: bool = False,
+            output_fmt: str = 'NCHW',
+            intermediates_only: bool = False,
+    ) -> Union[List[torch.Tensor], Tuple[torch.Tensor, List[torch.Tensor]]]:
+        """ Forward features that returns intermediates.
+
+        Args:
+            x: Input image tensor
+            indices: Take last n blocks if int, all if None, select matching indices if sequence
+            norm: Apply norm layer to compatible intermediates
+            stop_early: Stop iterating over blocks when last desired intermediate hit
+            output_fmt: Shape of intermediate feature outputs
+            intermediates_only: Only return intermediate features
+        Returns:
+
+        """
+        assert output_fmt in ('NCHW',), 'Output shape must be NCHW.'
+        intermediates = []
+        take_indices, max_index = feature_take_indices(len(self.stages), indices)
+
+        # forward pass
+        x = self.stem(x)
+
+        if torch.jit.is_scripting() or not stop_early:  # can't slice blocks in torchscript
+            stages = self.stages
         else:
-            if self.global_pool == 'avg':
-                self.head = SelectAdaptivePool2d(pool_type=self.global_pool, flatten=True)
+            stages = self.stages[:max_index + 1]
+
+        for feat_idx, stage in enumerate(stages):
+            if self.grad_checkpointing and not torch.jit.is_scripting():
+                x = checkpoint_seq(stages, x)
             else:
-                self.head = nn.Identity()
+                x = stage(x)
+            if feat_idx in take_indices:
+                intermediates.append(x)
+
+        if intermediates_only:
+            return intermediates
+
+        return x, intermediates
+
+    def prune_intermediate_layers(
+            self,
+            indices: Union[int, List[int]] = 1,
+            prune_norm: bool = False,
+            prune_head: bool = True,
+    ):
+        """ Prune layers not required for specified intermediates.
+        """
+        take_indices, max_index = feature_take_indices(len(self.stages), indices)
+        self.stages = self.stages[:max_index + 1]  # truncate blocks w/ stem as idx 0
+        if prune_head:
+            self.reset_classifier(0, '')
+        return take_indices
 
     def forward_features(self, x):
         x = self.stem(x)
@@ -777,27 +916,31 @@ class EfficientVit(nn.Module):
 class EfficientVitLarge(nn.Module):
     def __init__(
         self,
-        in_chans=3,
-        widths=(),
-        depths=(),
-        head_dim=32,
-        norm_layer=nn.BatchNorm2d,
-        act_layer=GELUTanh,
-        global_pool='avg',
-        head_widths=(),
-        drop_rate=0.0,
-        num_classes=1000,
-        norm_eps=1e-7,
+        in_chans: int = 3,
+        widths: Tuple[int, ...] = (),
+        depths: Tuple[int, ...] = (),
+        head_dim: int = 32,
+        norm_layer: Type[nn.Module] = nn.BatchNorm2d,
+        act_layer: Type[nn.Module] = GELUTanh,
+        global_pool: str = 'avg',
+        head_widths: Tuple[int, ...] = (),
+        drop_rate: float = 0.0,
+        num_classes: int = 1000,
+        norm_eps: float = 1e-7,
+        device=None,
+        dtype=None,
     ):
-        super(EfficientVitLarge, self).__init__()
+        dd = {'device': device, 'dtype': dtype}
+        super().__init__()
         self.grad_checkpointing = False
         self.global_pool = global_pool
         self.num_classes = num_classes
+        self.in_chans = in_chans
         self.norm_eps = norm_eps
         norm_layer = partial(norm_layer, eps=self.norm_eps)
 
         # input stem
-        self.stem = Stem(in_chans, widths[0], depths[0], norm_layer, act_layer, block_type='large')
+        self.stem = Stem(in_chans, widths[0], depths[0], norm_layer, act_layer, block_type='large', **dd)
         stride = self.stem.stride
 
         # stages
@@ -814,29 +957,24 @@ class EfficientVitLarge(nn.Module):
                 head_dim=head_dim,
                 vit_stage=i >= 3,
                 fewer_norm=i >= 2,
+                **dd,
             ))
             stride *= 2
             in_channels = w
             self.feature_info += [dict(num_chs=in_channels, reduction=stride, module=f'stages.{i}')]
 
         self.num_features = in_channels
-        self.head_widths = head_widths
-        self.head_dropout = drop_rate
-        if num_classes > 0:
-            self.head = ClassifierHead(
-                self.num_features,
-                self.head_widths,
-                n_classes=num_classes,
-                dropout=self.head_dropout,
-                global_pool=self.global_pool,
-                act_layer=act_layer,
-                norm_eps=self.norm_eps,
-            )
-        else:
-            if self.global_pool == 'avg':
-                self.head = SelectAdaptivePool2d(pool_type=global_pool, flatten=True)
-            else:
-                self.head = nn.Identity()
+        self.head = ClassifierHead(
+            self.num_features,
+            widths=head_widths,
+            num_classes=num_classes,
+            dropout=drop_rate,
+            pool_type=self.global_pool,
+            act_layer=act_layer,
+            norm_eps=self.norm_eps,
+            **dd,
+        )
+        self.head_hidden_size = self.head.num_features
 
     @torch.jit.ignore
     def group_matcher(self, coarse=False):
@@ -854,27 +992,72 @@ class EfficientVitLarge(nn.Module):
         self.grad_checkpointing = enable
 
     @torch.jit.ignore
-    def get_classifier(self):
+    def get_classifier(self) -> nn.Module:
         return self.head.classifier[-1]
 
     def reset_classifier(self, num_classes: int, global_pool: Optional[str] = None):
         self.num_classes = num_classes
-        if global_pool is not None:
-            self.global_pool = global_pool
-        if num_classes > 0:
-            self.head = ClassifierHead(
-                self.num_features,
-                self.head_widths,
-                n_classes=num_classes,
-                dropout=self.head_dropout,
-                global_pool=self.global_pool,
-                norm_eps=self.norm_eps
-            )
+        self.head.reset(num_classes, global_pool)
+
+    def forward_intermediates(
+            self,
+            x: torch.Tensor,
+            indices: Optional[Union[int, List[int]]] = None,
+            norm: bool = False,
+            stop_early: bool = False,
+            output_fmt: str = 'NCHW',
+            intermediates_only: bool = False,
+    ) -> Union[List[torch.Tensor], Tuple[torch.Tensor, List[torch.Tensor]]]:
+        """ Forward features that returns intermediates.
+
+        Args:
+            x: Input image tensor
+            indices: Take last n blocks if int, all if None, select matching indices if sequence
+            norm: Apply norm layer to compatible intermediates
+            stop_early: Stop iterating over blocks when last desired intermediate hit
+            output_fmt: Shape of intermediate feature outputs
+            intermediates_only: Only return intermediate features
+        Returns:
+
+        """
+        assert output_fmt in ('NCHW',), 'Output shape must be NCHW.'
+        intermediates = []
+        take_indices, max_index = feature_take_indices(len(self.stages), indices)
+
+        # forward pass
+        x = self.stem(x)
+
+        if torch.jit.is_scripting() or not stop_early:  # can't slice blocks in torchscript
+            stages = self.stages
         else:
-            if self.global_pool == 'avg':
-                self.head = SelectAdaptivePool2d(pool_type=self.global_pool, flatten=True)
+            stages = self.stages[:max_index + 1]
+
+        for feat_idx, stage in enumerate(stages):
+            if self.grad_checkpointing and not torch.jit.is_scripting():
+                x = checkpoint_seq(stages, x)
             else:
-                self.head = nn.Identity()
+                x = stage(x)
+            if feat_idx in take_indices:
+                intermediates.append(x)
+
+        if intermediates_only:
+            return intermediates
+
+        return x, intermediates
+
+    def prune_intermediate_layers(
+            self,
+            indices: Union[int, List[int]] = 1,
+            prune_norm: bool = False,
+            prune_head: bool = True,
+    ):
+        """ Prune layers not required for specified intermediates.
+        """
+        take_indices, max_index = feature_take_indices(len(self.stages), indices)
+        self.stages = self.stages[:max_index + 1]  # truncate blocks w/ stem as idx 0
+        if prune_head:
+            self.reset_classifier(0, '')
+        return take_indices
 
     def forward_features(self, x):
         x = self.stem(x)
@@ -902,6 +1085,7 @@ def _cfg(url='', **kwargs):
         'first_conv': 'stem.in_conv.conv',
         'classifier': 'head.classifier.4',
         'crop_pct': 0.95,
+        'license': 'apache-2.0',
         'input_size': (3, 224, 224),
         'pool_size': (7, 7),
         **kwargs,

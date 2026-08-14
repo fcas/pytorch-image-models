@@ -3,6 +3,7 @@ Sourced from https://github.com/Cadene/tensorflow-model-zoo.torch (MIT License) 
 based upon Google's Tensorflow implementation and pretrained weights (Apache 2.0 License)
 """
 from functools import partial
+from typing import List, Optional, Tuple, Union, Type
 
 import torch
 import torch.nn as nn
@@ -10,16 +11,23 @@ import torch.nn as nn
 from timm.data import IMAGENET_INCEPTION_MEAN, IMAGENET_INCEPTION_STD
 from timm.layers import create_classifier, ConvNormAct
 from ._builder import build_model_with_cfg
+from ._features import feature_take_indices
 from ._registry import register_model, generate_default_cfgs
 
 __all__ = ['InceptionV4']
 
 
 class Mixed3a(nn.Module):
-    def __init__(self, conv_block=ConvNormAct):
-        super(Mixed3a, self).__init__()
+    def __init__(
+            self,
+            conv_block: Type[nn.Module] = ConvNormAct,
+            device=None,
+            dtype=None,
+    ):
+        dd = {'device': device, 'dtype': dtype}
+        super().__init__()
         self.maxpool = nn.MaxPool2d(3, stride=2)
-        self.conv = conv_block(64, 96, kernel_size=3, stride=2)
+        self.conv = conv_block(64, 96, kernel_size=3, stride=2, **dd)
 
     def forward(self, x):
         x0 = self.maxpool(x)
@@ -29,19 +37,25 @@ class Mixed3a(nn.Module):
 
 
 class Mixed4a(nn.Module):
-    def __init__(self, conv_block=ConvNormAct):
-        super(Mixed4a, self).__init__()
+    def __init__(
+            self,
+            conv_block: Type[nn.Module] = ConvNormAct,
+            device=None,
+            dtype=None,
+    ):
+        dd = {'device': device, 'dtype': dtype}
+        super().__init__()
 
         self.branch0 = nn.Sequential(
-            conv_block(160, 64, kernel_size=1, stride=1),
-            conv_block(64, 96, kernel_size=3, stride=1)
+            conv_block(160, 64, kernel_size=1, stride=1, **dd),
+            conv_block(64, 96, kernel_size=3, stride=1, **dd)
         )
 
         self.branch1 = nn.Sequential(
-            conv_block(160, 64, kernel_size=1, stride=1),
-            conv_block(64, 64, kernel_size=(1, 7), stride=1, padding=(0, 3)),
-            conv_block(64, 64, kernel_size=(7, 1), stride=1, padding=(3, 0)),
-            conv_block(64, 96, kernel_size=(3, 3), stride=1)
+            conv_block(160, 64, kernel_size=1, stride=1, **dd),
+            conv_block(64, 64, kernel_size=(1, 7), stride=1, padding=(0, 3), **dd),
+            conv_block(64, 64, kernel_size=(7, 1), stride=1, padding=(3, 0), **dd),
+            conv_block(64, 96, kernel_size=(3, 3), stride=1, **dd)
         )
 
     def forward(self, x):
@@ -52,9 +66,15 @@ class Mixed4a(nn.Module):
 
 
 class Mixed5a(nn.Module):
-    def __init__(self, conv_block=ConvNormAct):
-        super(Mixed5a, self).__init__()
-        self.conv = conv_block(192, 192, kernel_size=3, stride=2)
+    def __init__(
+            self,
+            conv_block: Type[nn.Module] = ConvNormAct,
+            device=None,
+            dtype=None,
+    ):
+        dd = {'device': device, 'dtype': dtype}
+        super().__init__()
+        self.conv = conv_block(192, 192, kernel_size=3, stride=2, **dd)
         self.maxpool = nn.MaxPool2d(3, stride=2)
 
     def forward(self, x):
@@ -65,24 +85,30 @@ class Mixed5a(nn.Module):
 
 
 class InceptionA(nn.Module):
-    def __init__(self, conv_block=ConvNormAct):
-        super(InceptionA, self).__init__()
-        self.branch0 = conv_block(384, 96, kernel_size=1, stride=1)
+    def __init__(
+            self,
+            conv_block: Type[nn.Module] = ConvNormAct,
+            device=None,
+            dtype=None,
+    ):
+        dd = {'device': device, 'dtype': dtype}
+        super().__init__()
+        self.branch0 = conv_block(384, 96, kernel_size=1, stride=1, **dd)
 
         self.branch1 = nn.Sequential(
-            conv_block(384, 64, kernel_size=1, stride=1),
-            conv_block(64, 96, kernel_size=3, stride=1, padding=1)
+            conv_block(384, 64, kernel_size=1, stride=1, **dd),
+            conv_block(64, 96, kernel_size=3, stride=1, padding=1, **dd)
         )
 
         self.branch2 = nn.Sequential(
-            conv_block(384, 64, kernel_size=1, stride=1),
-            conv_block(64, 96, kernel_size=3, stride=1, padding=1),
-            conv_block(96, 96, kernel_size=3, stride=1, padding=1)
+            conv_block(384, 64, kernel_size=1, stride=1, **dd),
+            conv_block(64, 96, kernel_size=3, stride=1, padding=1, **dd),
+            conv_block(96, 96, kernel_size=3, stride=1, padding=1, **dd)
         )
 
         self.branch3 = nn.Sequential(
             nn.AvgPool2d(3, stride=1, padding=1, count_include_pad=False),
-            conv_block(384, 96, kernel_size=1, stride=1)
+            conv_block(384, 96, kernel_size=1, stride=1, **dd)
         )
 
     def forward(self, x):
@@ -95,14 +121,20 @@ class InceptionA(nn.Module):
 
 
 class ReductionA(nn.Module):
-    def __init__(self, conv_block=ConvNormAct):
-        super(ReductionA, self).__init__()
-        self.branch0 = conv_block(384, 384, kernel_size=3, stride=2)
+    def __init__(
+            self,
+            conv_block: Type[nn.Module] = ConvNormAct,
+            device=None,
+            dtype=None,
+    ):
+        dd = {'device': device, 'dtype': dtype}
+        super().__init__()
+        self.branch0 = conv_block(384, 384, kernel_size=3, stride=2, **dd)
 
         self.branch1 = nn.Sequential(
-            conv_block(384, 192, kernel_size=1, stride=1),
-            conv_block(192, 224, kernel_size=3, stride=1, padding=1),
-            conv_block(224, 256, kernel_size=3, stride=2)
+            conv_block(384, 192, kernel_size=1, stride=1, **dd),
+            conv_block(192, 224, kernel_size=3, stride=1, padding=1, **dd),
+            conv_block(224, 256, kernel_size=3, stride=2, **dd)
         )
 
         self.branch2 = nn.MaxPool2d(3, stride=2)
@@ -116,27 +148,33 @@ class ReductionA(nn.Module):
 
 
 class InceptionB(nn.Module):
-    def __init__(self, conv_block=ConvNormAct):
-        super(InceptionB, self).__init__()
-        self.branch0 = conv_block(1024, 384, kernel_size=1, stride=1)
+    def __init__(
+            self,
+            conv_block: Type[nn.Module] = ConvNormAct,
+            device=None,
+            dtype=None,
+    ):
+        dd = {'device': device, 'dtype': dtype}
+        super().__init__()
+        self.branch0 = conv_block(1024, 384, kernel_size=1, stride=1, **dd)
 
         self.branch1 = nn.Sequential(
-            conv_block(1024, 192, kernel_size=1, stride=1),
-            conv_block(192, 224, kernel_size=(1, 7), stride=1, padding=(0, 3)),
-            conv_block(224, 256, kernel_size=(7, 1), stride=1, padding=(3, 0))
+            conv_block(1024, 192, kernel_size=1, stride=1, **dd),
+            conv_block(192, 224, kernel_size=(1, 7), stride=1, padding=(0, 3), **dd),
+            conv_block(224, 256, kernel_size=(7, 1), stride=1, padding=(3, 0), **dd)
         )
 
         self.branch2 = nn.Sequential(
-            conv_block(1024, 192, kernel_size=1, stride=1),
-            conv_block(192, 192, kernel_size=(7, 1), stride=1, padding=(3, 0)),
-            conv_block(192, 224, kernel_size=(1, 7), stride=1, padding=(0, 3)),
-            conv_block(224, 224, kernel_size=(7, 1), stride=1, padding=(3, 0)),
-            conv_block(224, 256, kernel_size=(1, 7), stride=1, padding=(0, 3))
+            conv_block(1024, 192, kernel_size=1, stride=1, **dd),
+            conv_block(192, 192, kernel_size=(7, 1), stride=1, padding=(3, 0), **dd),
+            conv_block(192, 224, kernel_size=(1, 7), stride=1, padding=(0, 3), **dd),
+            conv_block(224, 224, kernel_size=(7, 1), stride=1, padding=(3, 0), **dd),
+            conv_block(224, 256, kernel_size=(1, 7), stride=1, padding=(0, 3), **dd)
         )
 
         self.branch3 = nn.Sequential(
             nn.AvgPool2d(3, stride=1, padding=1, count_include_pad=False),
-            conv_block(1024, 128, kernel_size=1, stride=1)
+            conv_block(1024, 128, kernel_size=1, stride=1, **dd)
         )
 
     def forward(self, x):
@@ -149,19 +187,25 @@ class InceptionB(nn.Module):
 
 
 class ReductionB(nn.Module):
-    def __init__(self, conv_block=ConvNormAct):
-        super(ReductionB, self).__init__()
+    def __init__(
+            self,
+            conv_block: Type[nn.Module] = ConvNormAct,
+            device=None,
+            dtype=None,
+    ):
+        dd = {'device': device, 'dtype': dtype}
+        super().__init__()
 
         self.branch0 = nn.Sequential(
-            conv_block(1024, 192, kernel_size=1, stride=1),
-            conv_block(192, 192, kernel_size=3, stride=2)
+            conv_block(1024, 192, kernel_size=1, stride=1, **dd),
+            conv_block(192, 192, kernel_size=3, stride=2, **dd)
         )
 
         self.branch1 = nn.Sequential(
-            conv_block(1024, 256, kernel_size=1, stride=1),
-            conv_block(256, 256, kernel_size=(1, 7), stride=1, padding=(0, 3)),
-            conv_block(256, 320, kernel_size=(7, 1), stride=1, padding=(3, 0)),
-            conv_block(320, 320, kernel_size=3, stride=2)
+            conv_block(1024, 256, kernel_size=1, stride=1, **dd),
+            conv_block(256, 256, kernel_size=(1, 7), stride=1, padding=(0, 3), **dd),
+            conv_block(256, 320, kernel_size=(7, 1), stride=1, padding=(3, 0), **dd),
+            conv_block(320, 320, kernel_size=3, stride=2, **dd)
         )
 
         self.branch2 = nn.MaxPool2d(3, stride=2)
@@ -175,24 +219,30 @@ class ReductionB(nn.Module):
 
 
 class InceptionC(nn.Module):
-    def __init__(self, conv_block=ConvNormAct):
-        super(InceptionC, self).__init__()
+    def __init__(
+            self,
+            conv_block: Type[nn.Module] = ConvNormAct,
+            device=None,
+            dtype=None,
+    ):
+        dd = {'device': device, 'dtype': dtype}
+        super().__init__()
 
-        self.branch0 = conv_block(1536, 256, kernel_size=1, stride=1)
+        self.branch0 = conv_block(1536, 256, kernel_size=1, stride=1, **dd)
 
-        self.branch1_0 = conv_block(1536, 384, kernel_size=1, stride=1)
-        self.branch1_1a = conv_block(384, 256, kernel_size=(1, 3), stride=1, padding=(0, 1))
-        self.branch1_1b = conv_block(384, 256, kernel_size=(3, 1), stride=1, padding=(1, 0))
+        self.branch1_0 = conv_block(1536, 384, kernel_size=1, stride=1, **dd)
+        self.branch1_1a = conv_block(384, 256, kernel_size=(1, 3), stride=1, padding=(0, 1), **dd)
+        self.branch1_1b = conv_block(384, 256, kernel_size=(3, 1), stride=1, padding=(1, 0), **dd)
 
-        self.branch2_0 = conv_block(1536, 384, kernel_size=1, stride=1)
-        self.branch2_1 = conv_block(384, 448, kernel_size=(3, 1), stride=1, padding=(1, 0))
-        self.branch2_2 = conv_block(448, 512, kernel_size=(1, 3), stride=1, padding=(0, 1))
-        self.branch2_3a = conv_block(512, 256, kernel_size=(1, 3), stride=1, padding=(0, 1))
-        self.branch2_3b = conv_block(512, 256, kernel_size=(3, 1), stride=1, padding=(1, 0))
+        self.branch2_0 = conv_block(1536, 384, kernel_size=1, stride=1, **dd)
+        self.branch2_1 = conv_block(384, 448, kernel_size=(3, 1), stride=1, padding=(1, 0), **dd)
+        self.branch2_2 = conv_block(448, 512, kernel_size=(1, 3), stride=1, padding=(0, 1), **dd)
+        self.branch2_3a = conv_block(512, 256, kernel_size=(1, 3), stride=1, padding=(0, 1), **dd)
+        self.branch2_3b = conv_block(512, 256, kernel_size=(3, 1), stride=1, padding=(1, 0), **dd)
 
         self.branch3 = nn.Sequential(
             nn.AvgPool2d(3, stride=1, padding=1, count_include_pad=False),
-            conv_block(1536, 256, kernel_size=1, stride=1)
+            conv_block(1536, 256, kernel_size=1, stride=1, **dd)
         )
 
     def forward(self, x):
@@ -219,19 +269,23 @@ class InceptionC(nn.Module):
 class InceptionV4(nn.Module):
     def __init__(
             self,
-            num_classes=1000,
-            in_chans=3,
-            output_stride=32,
-            drop_rate=0.,
-            global_pool='avg',
-            norm_layer='batchnorm2d',
-            norm_eps=1e-3,
-            act_layer='relu',
-    ):
-        super(InceptionV4, self).__init__()
+            num_classes: int = 1000,
+            in_chans: int = 3,
+            output_stride: int = 32,
+            drop_rate: float = 0.,
+            global_pool: str = 'avg',
+            norm_layer: str = 'batchnorm2d',
+            norm_eps: float = 1e-3,
+            act_layer: str = 'relu',
+            device=None,
+            dtype=None,
+    ) -> None:
+        dd = {'device': device, 'dtype': dtype}
+        super().__init__()
         assert output_stride == 32
         self.num_classes = num_classes
-        self.num_features = 1536
+        self.in_chans = in_chans
+        self.num_features = self.head_hidden_size = 1536
         conv_block = partial(
             ConvNormAct,
             padding=0,
@@ -242,18 +296,18 @@ class InceptionV4(nn.Module):
         )
 
         features = [
-            conv_block(in_chans, 32, kernel_size=3, stride=2),
-            conv_block(32, 32, kernel_size=3, stride=1),
-            conv_block(32, 64, kernel_size=3, stride=1, padding=1),
-            Mixed3a(conv_block),
-            Mixed4a(conv_block),
-            Mixed5a(conv_block),
+            conv_block(in_chans, 32, kernel_size=3, stride=2, **dd),
+            conv_block(32, 32, kernel_size=3, stride=1, **dd),
+            conv_block(32, 64, kernel_size=3, stride=1, padding=1, **dd),
+            Mixed3a(conv_block, **dd),
+            Mixed4a(conv_block, **dd),
+            Mixed5a(conv_block, **dd),
         ]
-        features += [InceptionA(conv_block) for _ in range(4)]
-        features += [ReductionA(conv_block)]  # Mixed6a
-        features += [InceptionB(conv_block) for _ in range(7)]
-        features += [ReductionB(conv_block)]  # Mixed7a
-        features += [InceptionC(conv_block) for _ in range(3)]
+        features += [InceptionA(conv_block, **dd) for _ in range(4)]
+        features += [ReductionA(conv_block, **dd)]  # Mixed6a
+        features += [InceptionB(conv_block, **dd) for _ in range(7)]
+        features += [ReductionB(conv_block, **dd)]  # Mixed7a
+        features += [InceptionC(conv_block, **dd) for _ in range(3)]
         self.features = nn.Sequential(*features)
         self.feature_info = [
             dict(num_chs=64, reduction=2, module='features.2'),
@@ -263,7 +317,12 @@ class InceptionV4(nn.Module):
             dict(num_chs=1536, reduction=32, module='features.21'),
         ]
         self.global_pool, self.head_drop, self.last_linear = create_classifier(
-            self.num_features, self.num_classes, pool_type=global_pool, drop_rate=drop_rate)
+            self.num_features,
+            self.num_classes,
+            pool_type=global_pool,
+            drop_rate=drop_rate,
+            **dd,
+        )
 
     @torch.jit.ignore
     def group_matcher(self, coarse=False):
@@ -277,13 +336,73 @@ class InceptionV4(nn.Module):
         assert not enable, 'gradient checkpointing not supported'
 
     @torch.jit.ignore
-    def get_classifier(self):
+    def get_classifier(self) -> nn.Module:
         return self.last_linear
 
-    def reset_classifier(self, num_classes, global_pool='avg'):
+    def reset_classifier(self, num_classes: int, global_pool: str = 'avg'):
         self.num_classes = num_classes
         self.global_pool, self.last_linear = create_classifier(
             self.num_features, self.num_classes, pool_type=global_pool)
+
+    def forward_intermediates(
+            self,
+            x: torch.Tensor,
+            indices: Optional[Union[int, List[int]]] = None,
+            norm: bool = False,
+            stop_early: bool = False,
+            output_fmt: str = 'NCHW',
+            intermediates_only: bool = False,
+    ) -> Union[List[torch.Tensor], Tuple[torch.Tensor, List[torch.Tensor]]]:
+        """ Forward features that returns intermediates.
+
+        Args:
+            x: Input image tensor
+            indices: Take last n blocks if int, all if None, select matching indices if sequence
+            norm: Apply norm layer to compatible intermediates
+            stop_early: Stop iterating over blocks when last desired intermediate hit
+            output_fmt: Shape of intermediate feature outputs
+            intermediates_only: Only return intermediate features
+        Returns:
+
+        """
+        assert output_fmt in ('NCHW',), 'Output shape must be NCHW.'
+        intermediates = []
+        stage_ends = [int(info['module'].split('.')[-1]) for info in self.feature_info]
+        take_indices, max_index = feature_take_indices(len(stage_ends), indices)
+        take_indices = [stage_ends[i] for i in take_indices]
+        max_index = stage_ends[max_index]
+
+        # forward pass
+        if torch.jit.is_scripting() or not stop_early:  # can't slice blocks in torchscript
+            stages = self.features
+        else:
+            stages = self.features[:max_index + 1]
+
+        for feat_idx, stage in enumerate(stages):
+            x = stage(x)
+            if feat_idx in take_indices:
+                intermediates.append(x)
+
+        if intermediates_only:
+            return intermediates
+
+        return x, intermediates
+
+    def prune_intermediate_layers(
+            self,
+            indices: Union[int, List[int]] = 1,
+            prune_norm: bool = False,
+            prune_head: bool = True,
+    ):
+        """ Prune layers not required for specified intermediates.
+        """
+        stage_ends = [int(info['module'].split('.')[-1]) for info in self.feature_info]
+        take_indices, max_index = feature_take_indices(len(stage_ends), indices)
+        max_index = stage_ends[max_index]
+        self.features = self.features[:max_index + 1]  # truncate blocks w/ stem as idx 0
+        if prune_head:
+            self.reset_classifier(0, '')
+        return take_indices
 
     def forward_features(self, x):
         return self.features(x)
@@ -316,6 +435,7 @@ default_cfgs = generate_default_cfgs({
         'crop_pct': 0.875, 'interpolation': 'bicubic',
         'mean': IMAGENET_INCEPTION_MEAN, 'std': IMAGENET_INCEPTION_STD,
         'first_conv': 'features.0.conv', 'classifier': 'last_linear',
+        'license': 'apache-2.0',
     }
 })
 

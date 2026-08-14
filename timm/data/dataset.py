@@ -15,7 +15,7 @@ from .readers import create_reader
 _logger = logging.getLogger(__name__)
 
 
-_ERROR_RETRY = 50
+_ERROR_RETRY = 20
 
 
 class ImageDataset(data.Dataset):
@@ -30,34 +30,37 @@ class ImageDataset(data.Dataset):
             input_img_mode='RGB',
             transform=None,
             target_transform=None,
+            additional_features=None,
+            **kwargs,
     ):
         if reader is None or isinstance(reader, str):
             reader = create_reader(
                 reader or '',
                 root=root,
                 split=split,
-                class_map=class_map
+                class_map=class_map,
+                additional_features=additional_features,
+                **kwargs,
             )
         self.reader = reader
         self.load_bytes = load_bytes
         self.input_img_mode = input_img_mode
         self.transform = transform
         self.target_transform = target_transform
-        self._consecutive_errors = 0
+        self.additional_features = additional_features
+        self._max_retries = _ERROR_RETRY
 
     def __getitem__(self, index):
-        img, target = self.reader[index]
-
-        try:
-            img = img.read() if self.load_bytes else Image.open(img)
-        except Exception as e:
-            _logger.warning(f'Skipped sample (index {index}, file {self.reader.filename(index)}). {str(e)}')
-            self._consecutive_errors += 1
-            if self._consecutive_errors < _ERROR_RETRY:
-                return self.__getitem__((index + 1) % len(self.reader))
-            else:
-                raise e
-        self._consecutive_errors = 0
+        for attempt in range(self._max_retries):
+            try:
+                img, target, *features = self.reader[index]
+                img = img.read() if self.load_bytes else Image.open(img)
+                break
+            except (IOError, OSError) as e:  # be specific
+                _logger.warning(f'Skipped sample (index {index}). {e}')
+                index = (index + 1) % len(self.reader)
+        else:
+            raise RuntimeError(f"Failed to load {self._max_retries} consecutive samples")
 
         if self.input_img_mode and not self.load_bytes:
             img = img.convert(self.input_img_mode)
@@ -69,7 +72,10 @@ class ImageDataset(data.Dataset):
         elif self.target_transform is not None:
             target = self.target_transform(target)
 
-        return img, target
+        if self.additional_features is None:
+            return img, target
+        else:
+            return img, target, *features
 
     def __len__(self):
         return len(self.reader)
@@ -101,6 +107,7 @@ class IterableImageDataset(data.IterableDataset):
             transform=None,
             target_transform=None,
             max_steps=None,
+            **kwargs,
     ):
         assert reader is not None
         if isinstance(reader, str):
@@ -119,12 +126,12 @@ class IterableImageDataset(data.IterableDataset):
                 input_key=input_key,
                 target_key=target_key,
                 max_steps=max_steps,
+                **kwargs,
             )
         else:
             self.reader = reader
         self.transform = transform
         self.target_transform = target_transform
-        self._consecutive_errors = 0
 
     def __iter__(self):
         for img, target in self.reader:

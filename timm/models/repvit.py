@@ -4,7 +4,7 @@ Paper: `RepViT: Revisiting Mobile CNN From ViT Perspective`
     - https://arxiv.org/abs/2307.09283
 
 @misc{wang2023repvit,
-      title={RepViT: Revisiting Mobile CNN From ViT Perspective}, 
+      title={RepViT: Revisiting Mobile CNN From ViT Perspective},
       author={Ao Wang and Hui Chen and Zijia Lin and Hengjun Pu and Guiguang Ding},
       year={2023},
       eprint={2307.09283},
@@ -14,9 +14,7 @@ Paper: `RepViT: Revisiting Mobile CNN From ViT Perspective`
 
 Adapted from official impl at https://github.com/jameslahm/RepViT
 """
-
-__all__ = ['RepVit']
-from typing import Optional
+from typing import List, Optional, Tuple, Union, Type
 
 import torch
 import torch.nn as nn
@@ -24,15 +22,31 @@ import torch.nn as nn
 from timm.data import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
 from timm.layers import SqueezeExcite, trunc_normal_, to_ntuple, to_2tuple
 from ._builder import build_model_with_cfg
-from ._manipulate import checkpoint_seq
+from ._features import feature_take_indices
+from ._manipulate import checkpoint, checkpoint_seq
 from ._registry import register_model, generate_default_cfgs
+
+__all__ = ['RepVit']
 
 
 class ConvNorm(nn.Sequential):
-    def __init__(self, in_dim, out_dim, ks=1, stride=1, pad=0, dilation=1, groups=1, bn_weight_init=1):
+    def __init__(
+            self,
+            in_dim: int,
+            out_dim: int,
+            ks: int = 1,
+            stride: int = 1,
+            pad: int = 0,
+            dilation: int = 1,
+            groups: int = 1,
+            bn_weight_init: float = 1,
+            device=None,
+            dtype=None,
+    ):
+        dd = {'device': device, 'dtype': dtype}
         super().__init__()
-        self.add_module('c', nn.Conv2d(in_dim, out_dim, ks, stride, pad, dilation, groups, bias=False))
-        self.add_module('bn', nn.BatchNorm2d(out_dim))
+        self.add_module('c', nn.Conv2d(in_dim, out_dim, ks, stride, pad, dilation, groups, bias=False, **dd))
+        self.add_module('bn', nn.BatchNorm2d(out_dim, **dd))
         nn.init.constant_(self.bn.weight, bn_weight_init)
         nn.init.constant_(self.bn.bias, 0)
 
@@ -58,10 +72,19 @@ class ConvNorm(nn.Sequential):
 
 
 class NormLinear(nn.Sequential):
-    def __init__(self, in_dim, out_dim, bias=True, std=0.02):
+    def __init__(
+            self,
+            in_dim: int,
+            out_dim: int,
+            bias: bool = True,
+            std: float = 0.02,
+            device=None,
+            dtype=None,
+    ):
+        dd = {'device': device, 'dtype': dtype}
         super().__init__()
-        self.add_module('bn', nn.BatchNorm1d(in_dim))
-        self.add_module('l', nn.Linear(in_dim, out_dim, bias=bias))
+        self.add_module('bn', nn.BatchNorm1d(in_dim, **dd))
+        self.add_module('l', nn.Linear(in_dim, out_dim, bias=bias, **dd))
         trunc_normal_(self.l.weight, std=std)
         if bias:
             nn.init.constant_(self.l.bias, 0)
@@ -83,16 +106,24 @@ class NormLinear(nn.Sequential):
 
 
 class RepVggDw(nn.Module):
-    def __init__(self, ed, kernel_size, legacy=False):
+    def __init__(
+            self,
+            ed: int,
+            kernel_size: int,
+            legacy: bool = False,
+            device=None,
+            dtype=None,
+    ):
+        dd = {'device': device, 'dtype': dtype}
         super().__init__()
-        self.conv = ConvNorm(ed, ed, kernel_size, 1, (kernel_size - 1) // 2, groups=ed)
+        self.conv = ConvNorm(ed, ed, kernel_size, 1, (kernel_size - 1) // 2, groups=ed, **dd)
         if legacy:
-            self.conv1 = ConvNorm(ed, ed, 1, 1, 0, groups=ed)
+            self.conv1 = ConvNorm(ed, ed, 1, 1, 0, groups=ed, **dd)
             # Make torchscript happy.
             self.bn = nn.Identity()
         else:
-            self.conv1 = nn.Conv2d(ed, ed, 1, 1, 0, groups=ed)
-            self.bn = nn.BatchNorm2d(ed)
+            self.conv1 = nn.Conv2d(ed, ed, 1, 1, 0, groups=ed, **dd)
+            self.bn = nn.BatchNorm2d(ed, **dd)
         self.dim = ed
         self.legacy = legacy
 
@@ -136,23 +167,41 @@ class RepVggDw(nn.Module):
 
 
 class RepVitMlp(nn.Module):
-    def __init__(self, in_dim, hidden_dim, act_layer):
+    def __init__(
+            self,
+            in_dim: int,
+            hidden_dim: int,
+            act_layer: Type[nn.Module],
+            device=None,
+            dtype=None,
+    ):
+        dd = {'device': device, 'dtype': dtype}
         super().__init__()
-        self.conv1 = ConvNorm(in_dim, hidden_dim, 1, 1, 0)
+        self.conv1 = ConvNorm(in_dim, hidden_dim, 1, 1, 0, **dd)
         self.act = act_layer()
-        self.conv2 = ConvNorm(hidden_dim, in_dim, 1, 1, 0, bn_weight_init=0)
+        self.conv2 = ConvNorm(hidden_dim, in_dim, 1, 1, 0, bn_weight_init=0, **dd)
 
     def forward(self, x):
         return self.conv2(self.act(self.conv1(x)))
 
 
 class RepViTBlock(nn.Module):
-    def __init__(self, in_dim, mlp_ratio, kernel_size, use_se, act_layer, legacy=False):
-        super(RepViTBlock, self).__init__()
-
-        self.token_mixer = RepVggDw(in_dim, kernel_size, legacy)
-        self.se = SqueezeExcite(in_dim, 0.25) if use_se else nn.Identity()
-        self.channel_mixer = RepVitMlp(in_dim, in_dim * mlp_ratio, act_layer)
+    def __init__(
+            self,
+            in_dim: int,
+            mlp_ratio: float,
+            kernel_size: int,
+            use_se: bool,
+            act_layer: Type[nn.Module],
+            legacy: bool = False,
+            device=None,
+            dtype=None,
+    ):
+        dd = {'device': device, 'dtype': dtype}
+        super().__init__()
+        self.token_mixer = RepVggDw(in_dim, kernel_size, legacy, **dd)
+        self.se = SqueezeExcite(in_dim, 0.25, **dd) if use_se else nn.Identity()
+        self.channel_mixer = RepVitMlp(in_dim, in_dim * mlp_ratio, act_layer, **dd)
 
     def forward(self, x):
         x = self.token_mixer(x)
@@ -163,11 +212,19 @@ class RepViTBlock(nn.Module):
 
 
 class RepVitStem(nn.Module):
-    def __init__(self, in_chs, out_chs, act_layer):
+    def __init__(
+            self,
+            in_chs: int,
+            out_chs: int,
+            act_layer: Type[nn.Module],
+            device=None,
+            dtype=None,
+    ):
+        dd = {'device': device, 'dtype': dtype}
         super().__init__()
-        self.conv1 = ConvNorm(in_chs, out_chs // 2, 3, 2, 1)
+        self.conv1 = ConvNorm(in_chs, out_chs // 2, 3, 2, 1, **dd)
         self.act1 = act_layer()
-        self.conv2 = ConvNorm(out_chs // 2, out_chs, 3, 2, 1)
+        self.conv2 = ConvNorm(out_chs // 2, out_chs, 3, 2, 1, **dd)
         self.stride = 4
 
     def forward(self, x):
@@ -175,12 +232,39 @@ class RepVitStem(nn.Module):
 
 
 class RepVitDownsample(nn.Module):
-    def __init__(self, in_dim, mlp_ratio, out_dim, kernel_size, act_layer, legacy=False):
+    def __init__(
+            self,
+            in_dim: int,
+            mlp_ratio: float,
+            out_dim: int,
+            kernel_size: int,
+            act_layer: Type[nn.Module],
+            legacy: bool = False,
+            device=None,
+            dtype=None,
+    ):
+        dd = {'device': device, 'dtype': dtype}
         super().__init__()
-        self.pre_block = RepViTBlock(in_dim, mlp_ratio, kernel_size, use_se=False, act_layer=act_layer, legacy=legacy)
-        self.spatial_downsample = ConvNorm(in_dim, in_dim, kernel_size, 2, (kernel_size - 1) // 2, groups=in_dim)
-        self.channel_downsample = ConvNorm(in_dim, out_dim, 1, 1)
-        self.ffn = RepVitMlp(out_dim, out_dim * mlp_ratio, act_layer)
+        self.pre_block = RepViTBlock(
+            in_dim,
+            mlp_ratio,
+            kernel_size,
+            use_se=False,
+            act_layer=act_layer,
+            legacy=legacy,
+            **dd,
+        )
+        self.spatial_downsample = ConvNorm(
+            in_dim,
+            in_dim,
+            kernel_size,
+            stride=2,
+            pad=(kernel_size - 1) // 2,
+            groups=in_dim,
+            **dd,
+        )
+        self.channel_downsample = ConvNorm(in_dim, out_dim, 1, 1, **dd)
+        self.ffn = RepVitMlp(out_dim, out_dim * mlp_ratio, act_layer, **dd)
 
     def forward(self, x):
         x = self.pre_block(x)
@@ -192,15 +276,24 @@ class RepVitDownsample(nn.Module):
 
 
 class RepVitClassifier(nn.Module):
-    def __init__(self, dim, num_classes, distillation=False, drop=0.0):
+    def __init__(
+            self,
+            dim: int,
+            num_classes: int,
+            distillation: bool = False,
+            drop: float = 0.0,
+            device=None,
+            dtype=None,
+    ):
+        dd = {'device': device, 'dtype': dtype}
         super().__init__()
         self.head_drop = nn.Dropout(drop)
-        self.head = NormLinear(dim, num_classes) if num_classes > 0 else nn.Identity()
+        self.head = NormLinear(dim, num_classes, **dd) if num_classes > 0 else nn.Identity()
         self.distillation = distillation
         self.distilled_training = False
         self.num_classes = num_classes
         if distillation:
-            self.head_dist = NormLinear(dim, num_classes) if num_classes > 0 else nn.Identity()
+            self.head_dist = NormLinear(dim, num_classes, **dd) if num_classes > 0 else nn.Identity()
 
     def forward(self, x):
         x = self.head_drop(x)
@@ -231,10 +324,31 @@ class RepVitClassifier(nn.Module):
 
 
 class RepVitStage(nn.Module):
-    def __init__(self, in_dim, out_dim, depth, mlp_ratio, act_layer, kernel_size=3, downsample=True, legacy=False):
+    def __init__(
+            self,
+            in_dim: int,
+            out_dim: int,
+            depth: int,
+            mlp_ratio: float,
+            act_layer: Type[nn.Module],
+            kernel_size: int = 3,
+            downsample: bool = True,
+            legacy: bool = False,
+            device=None,
+            dtype=None,
+    ):
+        dd = {'device': device, 'dtype': dtype}
         super().__init__()
         if downsample:
-            self.downsample = RepVitDownsample(in_dim, mlp_ratio, out_dim, kernel_size, act_layer, legacy)
+            self.downsample = RepVitDownsample(
+                in_dim,
+                mlp_ratio,
+                out_dim,
+                kernel_size,
+                act_layer=act_layer,
+                legacy=legacy,
+                **dd,
+            )
         else:
             assert in_dim == out_dim
             self.downsample = nn.Identity()
@@ -242,7 +356,7 @@ class RepVitStage(nn.Module):
         blocks = []
         use_se = True
         for _ in range(depth):
-            blocks.append(RepViTBlock(out_dim, mlp_ratio, kernel_size, use_se, act_layer, legacy))
+            blocks.append(RepViTBlock(out_dim, mlp_ratio, kernel_size, use_se, act_layer, legacy, **dd))
             use_se = not use_se
 
         self.blocks = nn.Sequential(*blocks)
@@ -256,27 +370,31 @@ class RepVitStage(nn.Module):
 class RepVit(nn.Module):
     def __init__(
         self,
-        in_chans=3,
-        img_size=224,
-        embed_dim=(48,),
-        depth=(2,),
-        mlp_ratio=2,
-        global_pool='avg',
-        kernel_size=3,
-        num_classes=1000,
-        act_layer=nn.GELU,
-        distillation=True,
-        drop_rate=0.0,
-        legacy=False,
+        in_chans: int = 3,
+        img_size: int = 224,
+        embed_dim: Tuple[int, ...] = (48,),
+        depth: Tuple[int, ...] = (2,),
+        mlp_ratio: float = 2,
+        global_pool: str = 'avg',
+        kernel_size: int = 3,
+        num_classes: int = 1000,
+        act_layer: Type[nn.Module] = nn.GELU,
+        distillation: bool = True,
+        drop_rate: float = 0.0,
+        legacy: bool = False,
+        device=None,
+        dtype=None,
     ):
-        super(RepVit, self).__init__()
+        super().__init__()
+        dd = {'device': device, 'dtype': dtype}
         self.grad_checkpointing = False
         self.global_pool = global_pool
         self.embed_dim = embed_dim
         self.num_classes = num_classes
+        self.in_chans = in_chans
 
         in_dim = embed_dim[0]
-        self.stem = RepVitStem(in_chans, in_dim, act_layer)
+        self.stem = RepVitStem(in_chans, in_dim, act_layer, **dd)
         stride = self.stem.stride
         resolution = tuple([i // p for i, p in zip(to_2tuple(img_size), to_2tuple(stride))])
 
@@ -297,6 +415,7 @@ class RepVit(nn.Module):
                     kernel_size=kernel_size,
                     downsample=downsample,
                     legacy=legacy,
+                    **dd,
                 )
             )
             stage_stride = 2 if downsample else 1
@@ -306,9 +425,9 @@ class RepVit(nn.Module):
             in_dim = embed_dim[i]
         self.stages = nn.Sequential(*stages)
 
-        self.num_features = embed_dim[-1]
+        self.num_features = self.head_hidden_size = embed_dim[-1]
         self.head_drop = nn.Dropout(drop_rate)
-        self.head = RepVitClassifier(embed_dim[-1], num_classes, distillation)
+        self.head = RepVitClassifier(embed_dim[-1], num_classes, distillation, **dd)
 
     @torch.jit.ignore
     def group_matcher(self, coarse=False):
@@ -320,20 +439,78 @@ class RepVit(nn.Module):
         self.grad_checkpointing = enable
 
     @torch.jit.ignore
-    def get_classifier(self):
+    def get_classifier(self) -> nn.Module:
         return self.head
 
-    def reset_classifier(self, num_classes: int, global_pool: Optional[str] = None, distillation=False):
+    def reset_classifier(self, num_classes: int, global_pool: Optional[str] = None, distillation: bool = False, device=None, dtype=None):
         self.num_classes = num_classes
         if global_pool is not None:
             self.global_pool = global_pool
-        self.head = (
-            RepVitClassifier(self.embed_dim[-1], num_classes, distillation) if num_classes > 0 else nn.Identity()
-        )
+        dd = {'device': device, 'dtype': dtype}
+        self.head = RepVitClassifier(self.embed_dim[-1], num_classes, distillation, **dd)
 
     @torch.jit.ignore
     def set_distilled_training(self, enable=True):
         self.head.distilled_training = enable
+
+    def forward_intermediates(
+            self,
+            x: torch.Tensor,
+            indices: Optional[Union[int, List[int]]] = None,
+            norm: bool = False,
+            stop_early: bool = False,
+            output_fmt: str = 'NCHW',
+            intermediates_only: bool = False,
+    ) -> Union[List[torch.Tensor], Tuple[torch.Tensor, List[torch.Tensor]]]:
+        """ Forward features that returns intermediates.
+
+        Args:
+            x: Input image tensor
+            indices: Take last n blocks if int, all if None, select matching indices if sequence
+            norm: Apply norm layer to compatible intermediates
+            stop_early: Stop iterating over blocks when last desired intermediate hit
+            output_fmt: Shape of intermediate feature outputs
+            intermediates_only: Only return intermediate features
+        Returns:
+
+        """
+        assert output_fmt in ('NCHW',), 'Output shape must be NCHW.'
+        intermediates = []
+        take_indices, max_index = feature_take_indices(len(self.stages), indices)
+
+        # forward pass
+        x = self.stem(x)
+        if torch.jit.is_scripting() or not stop_early:  # can't slice blocks in torchscript
+            stages = self.stages
+        else:
+            stages = self.stages[:max_index + 1]
+
+        for feat_idx, stage in enumerate(stages):
+            if self.grad_checkpointing and not torch.jit.is_scripting():
+                x = checkpoint(stage, x)
+            else:
+                x = stage(x)
+            if feat_idx in take_indices:
+                intermediates.append(x)
+
+        if intermediates_only:
+            return intermediates
+
+        return x, intermediates
+
+    def prune_intermediate_layers(
+            self,
+            indices: Union[int, List[int]] = 1,
+            prune_norm: bool = False,
+            prune_head: bool = True,
+    ):
+        """ Prune layers not required for specified intermediates.
+        """
+        take_indices, max_index = feature_take_indices(len(self.stages), indices)
+        self.stages = self.stages[:max_index + 1]  # truncate blocks w/ stem as idx 0
+        if prune_head:
+            self.reset_classifier(0, '')
+        return take_indices
 
     def forward_features(self, x):
         x = self.stem(x)
@@ -347,6 +524,8 @@ class RepVit(nn.Module):
         if self.global_pool == 'avg':
             x = x.mean((2, 3), keepdim=False)
         x = self.head_drop(x)
+        if pre_logits:
+            return x
         return self.head(x)
 
     def forward(self, x):
@@ -380,6 +559,7 @@ def _cfg(url='', **kwargs):
         'std': IMAGENET_DEFAULT_STD,
         'first_conv': 'stem.conv1.c',
         'classifier': ('head.head.l', 'head.head_dist.l'),
+        'license': 'apache-2.0',
         **kwargs,
     }
 

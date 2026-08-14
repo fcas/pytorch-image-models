@@ -9,13 +9,15 @@ from typing import List, Tuple, Optional, Union
 import torch
 import torch.nn.functional as F
 
-from .helpers import to_2tuple
+from ._fx import register_notrace_function
 
 _logger = logging.getLogger(__name__)
 
 
+@torch.fx.wrap
+@register_notrace_function
 def resample_abs_pos_embed(
-        posemb,
+        posemb: torch.Tensor,
         new_size: List[int],
         old_size: Optional[List[int]] = None,
         num_prefix_tokens: int = 1,
@@ -26,8 +28,11 @@ def resample_abs_pos_embed(
     # sort out sizes, assume square if old size not provided
     num_pos_tokens = posemb.shape[1]
     num_new_tokens = new_size[0] * new_size[1] + num_prefix_tokens
-    if num_new_tokens == num_pos_tokens and new_size[0] == new_size[1]:
-        return posemb
+    if num_new_tokens == num_pos_tokens:
+        if old_size is not None and old_size[0] == new_size[0] and old_size[1] == new_size[1]:
+            return posemb
+        if old_size is None and new_size[0] == new_size[1]:
+            return posemb
 
     if old_size is None:
         hw = int(math.sqrt(num_pos_tokens - num_prefix_tokens))
@@ -57,8 +62,10 @@ def resample_abs_pos_embed(
     return posemb
 
 
+@torch.fx.wrap
+@register_notrace_function
 def resample_abs_pos_embed_nhwc(
-        posemb,
+        posemb: torch.Tensor,
         new_size: List[int],
         interpolation: str = 'bicubic',
         antialias: bool = True,
@@ -69,7 +76,6 @@ def resample_abs_pos_embed_nhwc(
 
     orig_dtype = posemb.dtype
     posemb = posemb.float()
-    # do the interpolation
     posemb = posemb.reshape(1, posemb.shape[-3], posemb.shape[-2], posemb.shape[-1]).permute(0, 3, 1, 2)
     posemb = F.interpolate(posemb, size=new_size, mode=interpolation, antialias=antialias)
     posemb = posemb.permute(0, 2, 3, 1).to(orig_dtype)

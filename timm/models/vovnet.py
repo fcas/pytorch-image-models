@@ -11,15 +11,16 @@ for some reference, rewrote most of the code.
 Hacked together by / Copyright 2020 Ross Wightman
 """
 
-from typing import List
+from typing import List, Optional, Tuple, Union, Type
 
 import torch
 import torch.nn as nn
 
 from timm.data import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
 from timm.layers import ConvNormAct, SeparableConvNormAct, BatchNormAct2d, ClassifierHead, DropPath, \
-    create_attn, create_norm_act_layer
+    create_attn, create_norm_act_layer, calculate_drop_path_rates
 from ._builder import build_model_with_cfg
+from ._features import feature_take_indices
 from ._manipulate import checkpoint_seq
 from ._registry import register_model, generate_default_cfgs
 
@@ -27,8 +28,8 @@ __all__ = ['VovNet']  # model_registry will add each entrypoint fn to this
 
 
 class SequentialAppendList(nn.Sequential):
-    def __init__(self, *args):
-        super(SequentialAppendList, self).__init__(*args)
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args)
 
     def forward(self, x: torch.Tensor, concat_list: List[torch.Tensor]) -> torch.Tensor:
         for i, module in enumerate(self):
@@ -44,22 +45,25 @@ class OsaBlock(nn.Module):
 
     def __init__(
             self,
-            in_chs,
-            mid_chs,
-            out_chs,
-            layer_per_block,
-            residual=False,
-            depthwise=False,
-            attn='',
-            norm_layer=BatchNormAct2d,
-            act_layer=nn.ReLU,
-            drop_path=None,
+            in_chs: int,
+            mid_chs: int,
+            out_chs: int,
+            layer_per_block: int,
+            residual: bool = False,
+            depthwise: bool = False,
+            attn: str = '',
+            norm_layer: Type[nn.Module] = BatchNormAct2d,
+            act_layer: Type[nn.Module] = nn.ReLU,
+            drop_path: Optional[nn.Module] = None,
+            device=None,
+            dtype=None,
     ):
-        super(OsaBlock, self).__init__()
+        dd = {'device': device, 'dtype': dtype}
+        super().__init__()
 
         self.residual = residual
         self.depthwise = depthwise
-        conv_kwargs = dict(norm_layer=norm_layer, act_layer=act_layer)
+        conv_kwargs = dict(norm_layer=norm_layer, act_layer=act_layer, **dd)
 
         next_in_chs = in_chs
         if self.depthwise and next_in_chs != mid_chs:
@@ -82,7 +86,7 @@ class OsaBlock(nn.Module):
         next_in_chs = in_chs + layer_per_block * mid_chs
         self.conv_concat = ConvNormAct(next_in_chs, out_chs, **conv_kwargs)
 
-        self.attn = create_attn(attn, out_chs) if attn else None
+        self.attn = create_attn(attn, out_chs, **dd) if attn else None
 
         self.drop_path = drop_path
 
@@ -105,20 +109,23 @@ class OsaStage(nn.Module):
 
     def __init__(
             self,
-            in_chs,
-            mid_chs,
-            out_chs,
-            block_per_stage,
-            layer_per_block,
-            downsample=True,
-            residual=True,
-            depthwise=False,
-            attn='ese',
-            norm_layer=BatchNormAct2d,
-            act_layer=nn.ReLU,
-            drop_path_rates=None,
+            in_chs: int,
+            mid_chs: int,
+            out_chs: int,
+            block_per_stage: int,
+            layer_per_block: int,
+            downsample: bool = True,
+            residual: bool = True,
+            depthwise: bool = False,
+            attn: str = 'ese',
+            norm_layer: Type[nn.Module] = BatchNormAct2d,
+            act_layer: Type[nn.Module] = nn.ReLU,
+            drop_path_rates: Optional[List[float]] = None,
+            device=None,
+            dtype=None,
     ):
-        super(OsaStage, self).__init__()
+        dd = {'device': device, 'dtype': dtype}
+        super().__init__()
         self.grad_checkpointing = False
 
         if downsample:
@@ -134,9 +141,18 @@ class OsaStage(nn.Module):
             else:
                 drop_path = None
             blocks += [OsaBlock(
-                in_chs, mid_chs, out_chs, layer_per_block, residual=residual and i > 0, depthwise=depthwise,
-                attn=attn if last_block else '', norm_layer=norm_layer, act_layer=act_layer, drop_path=drop_path)
-            ]
+                in_chs,
+                mid_chs,
+                out_chs,
+                layer_per_block,
+                residual=residual and i > 0,
+                depthwise=depthwise,
+                attn=attn if last_block else '',
+                norm_layer=norm_layer,
+                act_layer=act_layer,
+                drop_path=drop_path,
+                **dd,
+            )]
             in_chs = out_chs
         self.blocks = nn.Sequential(*blocks)
 
@@ -154,15 +170,17 @@ class VovNet(nn.Module):
 
     def __init__(
             self,
-            cfg,
-            in_chans=3,
-            num_classes=1000,
-            global_pool='avg',
-            output_stride=32,
-            norm_layer=BatchNormAct2d,
-            act_layer=nn.ReLU,
-            drop_rate=0.,
-            drop_path_rate=0.,
+            cfg: dict,
+            in_chans: int = 3,
+            num_classes: int = 1000,
+            global_pool: str = 'avg',
+            output_stride: int = 32,
+            norm_layer: Type[nn.Module] = BatchNormAct2d,
+            act_layer: Type[nn.Module] = nn.ReLU,
+            drop_rate: float = 0.,
+            drop_path_rate: float = 0.,
+            device=None,
+            dtype=None,
             **kwargs,
     ):
         """
@@ -178,8 +196,10 @@ class VovNet(nn.Module):
             drop_path_rate (float): Stochastic depth drop-path rate (default: 0.)
             kwargs (dict): Extra kwargs overlayed onto cfg
         """
-        super(VovNet, self).__init__()
+        super().__init__()
+        dd = {'device': device, 'dtype': dtype}
         self.num_classes = num_classes
+        self.in_chans = in_chans
         self.drop_rate = drop_rate
         assert output_stride == 32  # FIXME support dilation
 
@@ -190,7 +210,7 @@ class VovNet(nn.Module):
         stage_out_chs = cfg["stage_out_chs"]
         block_per_stage = cfg["block_per_stage"]
         layer_per_block = cfg["layer_per_block"]
-        conv_kwargs = dict(norm_layer=norm_layer, act_layer=act_layer)
+        conv_kwargs = dict(norm_layer=norm_layer, act_layer=act_layer, **dd)
 
         # Stem module
         last_stem_stride = stem_stride // 2
@@ -205,7 +225,7 @@ class VovNet(nn.Module):
         current_stride = stem_stride
 
         # OSA stages
-        stage_dpr = torch.split(torch.linspace(0, drop_path_rate, sum(block_per_stage)), block_per_stage)
+        stage_dpr = calculate_drop_path_rates(drop_path_rate, block_per_stage, stagewise=True)
         in_ch_list = stem_chs[-1:] + stage_out_chs[:-1]
         stage_args = dict(residual=cfg["residual"], depthwise=cfg["depthwise"], attn=cfg["attn"], **conv_kwargs)
         stages = []
@@ -227,7 +247,8 @@ class VovNet(nn.Module):
 
         self.stages = nn.Sequential(*stages)
 
-        self.head = ClassifierHead(self.num_features, num_classes, pool_type=global_pool, drop_rate=drop_rate)
+        self.head_hidden_size = self.num_features
+        self.head = ClassifierHead(self.num_features, num_classes, pool_type=global_pool, drop_rate=drop_rate, **dd)
 
         for n, m in self.named_modules():
             if isinstance(m, nn.Conv2d):
@@ -248,11 +269,73 @@ class VovNet(nn.Module):
             s.grad_checkpointing = enable
 
     @torch.jit.ignore
-    def get_classifier(self):
+    def get_classifier(self) -> nn.Module:
         return self.head.fc
 
-    def reset_classifier(self, num_classes, global_pool='avg'):
-        self.head = ClassifierHead(self.num_features, num_classes, pool_type=global_pool, drop_rate=self.drop_rate)
+    def reset_classifier(self, num_classes, global_pool: Optional[str] = None):
+        self.num_classes = num_classes
+        self.head.reset(num_classes, global_pool)
+
+    def forward_intermediates(
+            self,
+            x: torch.Tensor,
+            indices: Optional[Union[int, List[int]]] = None,
+            norm: bool = False,
+            stop_early: bool = False,
+            output_fmt: str = 'NCHW',
+            intermediates_only: bool = False,
+    ) -> Union[List[torch.Tensor], Tuple[torch.Tensor, List[torch.Tensor]]]:
+        """ Forward features that returns intermediates.
+
+        Args:
+            x: Input image tensor
+            indices: Take last n blocks if int, all if None, select matching indices if sequence
+            norm: Apply norm layer to compatible intermediates
+            stop_early: Stop iterating over blocks when last desired intermediate hit
+            output_fmt: Shape of intermediate feature outputs
+            intermediates_only: Only return intermediate features
+        Returns:
+
+        """
+        assert output_fmt in ('NCHW',), 'Output shape must be NCHW.'
+        intermediates = []
+        take_indices, max_index = feature_take_indices(5, indices)
+
+        # forward pass
+        feat_idx = 0
+        x = self.stem[:-1](x)
+        if feat_idx in take_indices:
+            intermediates.append(x)
+
+        x = self.stem[-1](x)
+        if torch.jit.is_scripting() or not stop_early:  # can't slice blocks in torchscript
+            stages = self.stages
+        else:
+            stages = self.stages[:max_index]
+
+        for feat_idx, stage in enumerate(stages, start=1):
+            x = stage(x)
+            if feat_idx in take_indices:
+                intermediates.append(x)
+
+        if intermediates_only:
+            return intermediates
+
+        return x, intermediates
+
+    def prune_intermediate_layers(
+            self,
+            indices: Union[int, List[int]] = 1,
+            prune_norm: bool = False,
+            prune_head: bool = True,
+    ):
+        """ Prune layers not required for specified intermediates.
+        """
+        take_indices, max_index = feature_take_indices(5, indices)
+        self.stages = self.stages[:max_index]  # truncate blocks w/ stem as idx 0
+        if prune_head:
+            self.reset_classifier(0, '')
+        return take_indices
 
     def forward_features(self, x):
         x = self.stem(x)
@@ -394,7 +477,8 @@ def _cfg(url='', **kwargs):
         'url': url, 'num_classes': 1000, 'input_size': (3, 224, 224), 'pool_size': (7, 7),
         'crop_pct': 0.875, 'interpolation': 'bicubic',
         'mean': IMAGENET_DEFAULT_MEAN, 'std': IMAGENET_DEFAULT_STD,
-        'first_conv': 'stem.0.conv', 'classifier': 'head.fc', **kwargs,
+        'first_conv': 'stem.0.conv', 'classifier': 'head.fc', 
+        'license': 'apache-2.0', **kwargs,
     }
 
 
@@ -409,7 +493,12 @@ default_cfgs = generate_default_cfgs({
     'ese_vovnet39b.ra_in1k': _cfg(
         hf_hub_id='timm/',
         test_input_size=(3, 288, 288), test_crop_pct=0.95),
-    'ese_vovnet57b.untrained': _cfg(url=''),
+    'ese_vovnet57b.ra4_e3600_r256_in1k': _cfg(
+        hf_hub_id='timm/',
+        mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5),
+        crop_pct=0.95, input_size=(3, 256, 256), pool_size=(8, 8),
+        test_input_size=(3, 320, 320), test_crop_pct=1.0
+    ),
     'ese_vovnet99b.untrained': _cfg(url=''),
     'eca_vovnet39b.untrained': _cfg(url=''),
     'ese_vovnet39b_evos.untrained': _cfg(url=''),

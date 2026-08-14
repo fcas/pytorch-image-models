@@ -10,6 +10,10 @@ similar in behaviour to APEX FusedLamb if you aren't using NVIDIA GPUs or cannot
 
 In addition to some cleanup, this Lamb impl has been modified to support PyTorch XLA and has been tested on TPU.
 
+References for added functionality:
+    Cautious Optimizers: https://arxiv.org/abs/2411.16085
+    Why Gradients Rapidly Increase Near the End of Training: https://arxiv.org/abs/2506.02285
+
 Original copyrights for above sources are below.
 
 Modifications Copyright 2021 Ross Wightman
@@ -51,47 +55,99 @@ Modifications Copyright 2021 Ross Wightman
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
-import math
+from typing import Optional, Tuple
 
 import torch
 from torch.optim import Optimizer
+
+from ._helpers import _add_scaled_, _get_value, _init_scalar, _validate_scalar
+from ._types import ParamsT
 
 
 class Lamb(Optimizer):
     """Implements a pure pytorch variant of FuseLAMB (NvLamb variant) optimizer from apex.optimizers.FusedLAMB
     reference: https://github.com/NVIDIA/DeepLearningExamples/blob/master/PyTorch/LanguageModeling/Transformer-XL/pytorch/lamb.py
 
-    LAMB was proposed in `Large Batch Optimization for Deep Learning: Training BERT in 76 minutes`_.
+    LAMB was proposed in:
+    - Large Batch Optimization for Deep Learning - Training BERT in 76 minutes:  https://arxiv.org/abs/1904.00962
+    - On the Convergence of Adam and Beyond: https://openreview.net/forum?id=ryQu7f-RZ
 
-    Arguments:
-        params (iterable): iterable of parameters to optimize or dicts defining parameter groups.
-        lr (float, optional): learning rate. (default: 1e-3)
-        betas (Tuple[float, float], optional): coefficients used for computing
-            running averages of gradient and its norm. (default: (0.9, 0.999))
-        eps (float, optional): term added to the denominator to improve
-            numerical stability. (default: 1e-8)
-        weight_decay (float, optional): weight decay (L2 penalty) (default: 0)
-        grad_averaging (bool, optional): whether apply (1-beta2) to grad when
-            calculating running averages of gradient. (default: True)
-        max_grad_norm (float, optional): value used to clip global grad norm (default: 1.0)
-        trust_clip (bool): enable LAMBC trust ratio clipping (default: False)
-        always_adapt (boolean, optional): Apply adaptive learning rate to 0.0
-            weight decay parameter (default: False)
-
-    .. _Large Batch Optimization for Deep Learning - Training BERT in 76 minutes:
-        https://arxiv.org/abs/1904.00962
-    .. _On the Convergence of Adam and Beyond:
-        https://openreview.net/forum?id=ryQu7f-RZ
+    Args:
+        params: Iterable of parameters to optimize or dicts defining parameter groups.
+        lr: Learning rate
+        betas: Coefficients used for computing running averages of gradient and its norm.
+        eps: Term added to the denominator to improve numerical stability.
+        weight_decay: Weight decay
+        grad_averaging: Whether apply (1-beta2) to grad when calculating running averages of gradient.
+        max_grad_norm: Value used to clip global grad norm.
+        trust_clip: Enable LAMBC trust ratio clipping.
+        always_adapt: Apply adaptive learning rate to 0.0 weight decay parameter.
+        caution: Apply caution.
+        decoupled: apply decoupled weight decay
+        corrected_weight_decay: apply corrected weight decay (lr**2 / max_lr) when using decoupled_decay
     """
 
     def __init__(
-            self, params, lr=1e-3, bias_correction=True, betas=(0.9, 0.999), eps=1e-6,
-            weight_decay=0.01, grad_averaging=True, max_grad_norm=1.0, trust_clip=False, always_adapt=False):
+            self,
+            params: ParamsT,
+            lr: float = 1e-3,
+            bias_correction: bool = True,
+            betas: Tuple[float, float] = (0.9, 0.999),
+            eps: float = 1e-6,
+            weight_decay: float = 0.01,
+            grad_averaging: bool = True,
+            max_grad_norm: Optional[float] = 1.0,
+            trust_clip: bool = False,
+            always_adapt: bool = False,
+            caution: bool = False,
+            decoupled_decay: bool = False,
+            corrected_weight_decay: bool = False,
+    ):
+        _validate_scalar("learning rate", lr)
+        _validate_scalar("epsilon", eps)
+        _validate_scalar("weight_decay", weight_decay)
         defaults = dict(
-            lr=lr, bias_correction=bias_correction, betas=betas, eps=eps, weight_decay=weight_decay,
-            grad_averaging=grad_averaging, max_grad_norm=max_grad_norm,
-            trust_clip=trust_clip, always_adapt=always_adapt)
+            lr=lr,
+            bias_correction=bias_correction,
+            betas=betas,
+            eps=eps,
+            weight_decay=weight_decay,
+            grad_averaging=grad_averaging,
+            max_grad_norm=max_grad_norm,
+            trust_clip=trust_clip,
+            always_adapt=always_adapt,
+            caution=caution,
+            decoupled_decay=decoupled_decay,
+            corrected_weight_decay=corrected_weight_decay,
+        )
         super().__init__(params, defaults)
+
+    def __setstate__(self, state):
+        super().__setstate__(state)
+        for group in self.param_groups:
+            group.setdefault('caution', False)
+            group.setdefault('decoupled_decay', False)
+            group.setdefault('corrected_weight_decay', False)
+            if 'step' in group:
+                group['step'] = _init_scalar(group['step'], device='cpu')
+
+    def _get_clip_grad_norm(self):
+        max_grad_norm = self.defaults['max_grad_norm']
+        if max_grad_norm is None:
+            return None
+
+        norms = []
+        for group in self.param_groups:
+            for p in group['params']:
+                if p.grad is None:
+                    continue
+                grad = p.grad
+                if grad.is_sparse:
+                    raise RuntimeError('Lamb does not support sparse gradients, consider SparseAdam instead.')
+                norms.append(torch.linalg.vector_norm(grad))
+        global_norm = torch.linalg.vector_norm(torch.stack(norms))
+        clip_global_norm = (global_norm / max_grad_norm).clamp_(min=1.0)
+        return clip_global_norm
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -105,26 +161,7 @@ class Lamb(Optimizer):
             with torch.enable_grad():
                 loss = closure()
 
-        device = self.param_groups[0]['params'][0].device
-        one_tensor = torch.tensor(1.0, device=device)  # because torch.where doesn't handle scalars correctly
-        global_grad_norm = torch.zeros(1, device=device)
-        for group in self.param_groups:
-            for p in group['params']:
-                if p.grad is None:
-                    continue
-                grad = p.grad
-                if grad.is_sparse:
-                    raise RuntimeError('Lamb does not support sparse gradients, consider SparseAdam instad.')
-                global_grad_norm.add_(grad.pow(2).sum())
-
-        global_grad_norm = torch.sqrt(global_grad_norm)
-        # FIXME it'd be nice to remove explicit tensor conversion of scalars when torch.where promotes
-        # scalar types properly https://github.com/pytorch/pytorch/issues/9190
-        max_grad_norm = torch.tensor(self.defaults['max_grad_norm'], device=device)
-        clip_global_grad_norm = torch.where(
-            global_grad_norm > max_grad_norm,
-            global_grad_norm / max_grad_norm,
-            one_tensor)
+        clip_grad_norm = self._get_clip_grad_norm() # None if disabled
 
         for group in self.param_groups:
             bias_correction = 1 if group['bias_correction'] else 0
@@ -134,21 +171,29 @@ class Lamb(Optimizer):
 
             # assume same step across group now to simplify things
             # per parameter step can be easily support by making it tensor, or pass list into kernel
-            if 'step' in group:
-                group['step'] += 1
-            else:
-                group['step'] = 1
+            if 'step' not in group:
+                group['step'] = _init_scalar(device='cpu')
+            group['step'].add_(1)
+
+            if not any(p.grad is not None for p in group['params']):
+                continue
+
+            step = _get_value(group['step'])
 
             if bias_correction:
-                bias_correction1 = 1 - beta1 ** group['step']
-                bias_correction2 = 1 - beta2 ** group['step']
+                bias_correction1 = 1 - beta1 ** step
+                bias_correction2 = 1 - beta2 ** step
             else:
                 bias_correction1, bias_correction2 = 1.0, 1.0
 
             for p in group['params']:
                 if p.grad is None:
                     continue
-                grad = p.grad.div_(clip_global_grad_norm)
+                grad = p.grad
+
+                if clip_grad_norm is not None:
+                    grad.div_(clip_grad_norm)
+
                 state = self.state[p]
 
                 # State initialization
@@ -164,29 +209,44 @@ class Lamb(Optimizer):
                 exp_avg.mul_(beta1).add_(grad, alpha=beta3)  # m_t
                 exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)  # v_t
 
-                denom = (exp_avg_sq.sqrt() / math.sqrt(bias_correction2)).add_(group['eps'])
+                denom = (exp_avg_sq.sqrt() / (bias_correction2 ** 0.5)).add_(group['eps'])
                 update = (exp_avg / bias_correction1).div_(denom)
+
+                if group['caution']:
+                    # Apply caution as per 'Cautious Optimizers' - https://arxiv.org/abs/2411.16085
+                    mask = (update * grad > 0).to(grad.dtype)
+                    mask.div_(mask.mean().clamp_(min=1e-3))
+                    update.mul_(mask)
 
                 weight_decay = group['weight_decay']
                 if weight_decay != 0:
-                    update.add_(p, alpha=weight_decay)
+                    if group.get('decoupled_decay', False):
+                        if group['corrected_weight_decay']:
+                            wd_scale = group['lr'] ** 2 / self.defaults['lr']
+                        else:
+                            wd_scale = group['lr']
+                        _add_scaled_(p, p, -wd_scale * weight_decay)
+                    else:
+                        update.add_(p, alpha=weight_decay)
 
                 if weight_decay != 0 or group['always_adapt']:
                     # Layer-wise LR adaptation. By default, skip adaptation on parameters that are
                     # excluded from weight decay, unless always_adapt == True, then always enabled.
                     w_norm = p.norm(2.0)
                     g_norm = update.norm(2.0)
+                    trust_ratio = w_norm / g_norm
                     # FIXME nested where required since logical and/or not working in PT XLA
+                    # Set the ratio to 1.0 (no change) if either weight norm or grad norm is zero
                     trust_ratio = torch.where(
                         w_norm > 0,
-                        torch.where(g_norm > 0, w_norm / g_norm, one_tensor),
-                        one_tensor,
+                        torch.where(g_norm > 0, trust_ratio, 1.0),
+                        1.0,
                     )
                     if group['trust_clip']:
                         # LAMBC trust clipping, upper bound fixed at one
-                        trust_ratio = torch.minimum(trust_ratio, one_tensor)
+                        trust_ratio = torch.clamp(trust_ratio, max=1.0)
                     update.mul_(trust_ratio)
 
-                p.add_(update, alpha=-group['lr'])
+                _add_scaled_(p, update, -group['lr'])
 
         return loss

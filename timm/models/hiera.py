@@ -24,22 +24,35 @@ Adapted for timm from originals at https://github.com/facebookresearch/hiera
 # --------------------------------------------------------
 import math
 from functools import partial
-from typing import Callable, Dict, List, Optional, Tuple, Type, Union
+from typing import Dict, List, Optional, Tuple, Type, Union
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.checkpoint import checkpoint
-
 
 from timm.data import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
-from timm.layers import DropPath, Mlp, use_fused_attn, _assert, get_norm_layer
-
+from timm.layers import (
+    DropPath,
+    calculate_drop_path_rates,
+    Mlp,
+    LayerScale,
+    ClNormMlpClassifierHead,
+    use_fused_attn,
+    _assert,
+    get_norm_layer,
+    to_2tuple,
+    init_weight_vit,
+    init_weight_jax,
+)
 
 from ._registry import generate_default_cfgs, register_model
 from ._builder import build_model_with_cfg
 from ._features import feature_take_indices
 from ._features_fx import register_notrace_function
+from ._manipulate import named_apply, checkpoint
+
+
+__all__ = ['Hiera']
 
 
 def conv_nd(n: int) -> Type[nn.Module]:
@@ -256,6 +269,8 @@ class MaskUnitAttention(nn.Module):
             q_stride: int = 1,
             window_size: int = 0,
             use_mask_unit_attn: bool = False,
+            device=None,
+            dtype=None,
     ):
         """
         Args:
@@ -265,8 +280,8 @@ class MaskUnitAttention(nn.Module):
         - window_size: The current (flattened) size of a mask unit *after* pooling (if any).
         - use_mask_unit_attn: Use Mask Unit or Global Attention.
         """
+        dd = {'device': device, 'dtype': dtype}
         super().__init__()
-
         self.dim = dim
         self.dim_out = dim_out
         self.heads = heads
@@ -275,8 +290,8 @@ class MaskUnitAttention(nn.Module):
         self.scale = self.head_dim ** -0.5
         self.fused_attn = use_fused_attn()
 
-        self.qkv = nn.Linear(dim, 3 * dim_out)
-        self.proj = nn.Linear(dim_out, dim_out)
+        self.qkv = nn.Linear(dim, 3 * dim_out, **dd)
+        self.proj = nn.Linear(dim_out, dim_out, **dd)
 
         self.window_size = window_size
         self.use_mask_unit_attn = use_mask_unit_attn
@@ -284,14 +299,31 @@ class MaskUnitAttention(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """ Input should be of shape [batch, tokens, channels]. """
         B, N, _ = x.shape
-        num_windows = (N // (self.q_stride * self.window_size)) if self.use_mask_unit_attn else 1
 
-        qkv = self.qkv(x).reshape(B, -1, num_windows, 3, self.heads, self.head_dim).permute(3, 0, 4, 2, 1, 5)
-        q, k, v = qkv.unbind(0)
+        if self.use_mask_unit_attn:
+            # Windowed attention: 5D path [B, heads, num_windows, tokens_per_window, head_dim]
+            num_windows = N // (self.q_stride * self.window_size)
+            qkv = self.qkv(x).reshape(
+                B, -1, num_windows, 3, self.heads, self.head_dim,
+            ).permute(3, 0, 4, 2, 1, 5)
+            q, k, v = qkv.unbind(0)
 
-        if self.q_stride > 1:
-            # Refer to Unroll to see how this performs a maxpool-Nd
-            q = q.view(B, self.heads, num_windows, self.q_stride, -1, self.head_dim).amax(dim=3)
+            if self.q_stride > 1:
+                # Refer to Unroll to see how this performs a maxpool-Nd
+                q = q.view(B, self.heads, num_windows, self.q_stride, -1, self.head_dim).amax(dim=3)
+        else:
+            # Global attention: 4D path [B, heads, N, head_dim]
+            # Avoids the dummy num_windows=1 dimension that prevents FlashAttention dispatch.
+            qkv = self.qkv(x).reshape(B, N, 3, self.heads, self.head_dim).permute(2, 0, 3, 1, 4)
+            q, k, v = qkv.unbind(0)
+
+            if self.q_stride > 1:
+                # dim=2 instead of dim=3 because num_windows dimension is absent
+                q = q.view(B, self.heads, self.q_stride, -1, self.head_dim).amax(dim=2)
+
+            # Enforce contiguous memory layout so SDPA dispatches to FlashAttention
+            # instead of silently falling back to the O(N^2) math backend.
+            q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
 
         if self.fused_attn:
             # Note: the original paper did *not* use SDPA, it's a free boost!
@@ -301,7 +333,12 @@ class MaskUnitAttention(nn.Module):
             attn = attn.softmax(dim=-1)
             x = attn @ v
 
-        x = x.transpose(1, 3).reshape(B, -1, self.dim_out)
+        # Output transpose adapts to 5D (windowed) vs 4D (global) layout
+        if self.use_mask_unit_attn:
+            x = x.transpose(1, 3).reshape(B, -1, self.dim_out)
+        else:
+            x = x.transpose(1, 2).reshape(B, -1, self.dim_out)
+
         x = self.proj(x)
         return x
 
@@ -314,23 +351,26 @@ class HieraBlock(nn.Module):
             heads: int,
             mlp_ratio: float = 4.0,
             drop_path: float = 0.0,
-            norm_layer: nn.Module = nn.LayerNorm,
-            act_layer: nn.Module = nn.GELU,
+            init_values: Optional[float] = None,
+            norm_layer: Type[nn.Module] = nn.LayerNorm,
+            act_layer: Type[nn.Module] = nn.GELU,
             q_stride: int = 1,
             window_size: int = 0,
             use_expand_proj: bool = True,
             use_mask_unit_attn: bool = False,
+            device=None,
+            dtype=None,
     ):
+        dd = {'device': device, 'dtype': dtype}
         super().__init__()
-
         self.dim = dim
         self.dim_out = dim_out
 
-        self.norm1 = norm_layer(dim)
+        self.norm1 = norm_layer(dim, **dd)
         if dim != dim_out:
             self.do_expand = True
             if use_expand_proj:
-                self.proj = nn.Linear(dim, dim_out)
+                self.proj = nn.Linear(dim, dim_out, **dd)
             else:
                 assert dim_out == dim * 2
                 self.proj = None
@@ -343,14 +383,16 @@ class HieraBlock(nn.Module):
             heads,
             q_stride,
             window_size,
-            use_mask_unit_attn
+            use_mask_unit_attn,
+            **dd
         )
+        self.ls1 = LayerScale(dim_out, init_values=init_values, **dd) if init_values is not None else nn.Identity()
         self.drop_path1 = DropPath(drop_path) if drop_path > 0 else nn.Identity()
 
-        self.norm2 = norm_layer(dim_out)
-        self.mlp = Mlp(dim_out, int(dim_out * mlp_ratio), act_layer=act_layer)
+        self.norm2 = norm_layer(dim_out, **dd)
+        self.mlp = Mlp(dim_out, int(dim_out * mlp_ratio), act_layer=act_layer, **dd)
+        self.ls2 = LayerScale(dim_out, init_values=init_values, **dd) if init_values is not None else nn.Identity()
         self.drop_path2 = DropPath(drop_path) if drop_path > 0 else nn.Identity()
-
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Attention + Q Pooling
@@ -366,48 +408,10 @@ class HieraBlock(nn.Module):
                     ],
                     dim=-1,
                 )
-        x = x + self.drop_path1(self.attn(x_norm))
+        x = x + self.drop_path1(self.ls1(self.attn(x_norm)))
 
         # MLP
-        x = x + self.drop_path2(self.mlp(self.norm2(x)))
-        return x
-
-
-class NormClassifierHead(nn.Module):
-    def __init__(
-            self,
-            in_features: int,
-            num_classes: int,
-            pool_type: str = 'avg',
-            drop_rate: float = 0.0,
-            norm_layer: Union[str, Callable] = 'layernorm',
-    ):
-        super().__init__()
-        norm_layer = get_norm_layer(norm_layer)
-        assert pool_type in ('avg', '')
-        self.in_features = self.num_features = in_features
-        self.pool_type = pool_type
-        self.norm = norm_layer(in_features)
-        self.drop = nn.Dropout(drop_rate) if drop_rate else nn.Identity()
-        self.fc = nn.Linear(in_features, num_classes)  if num_classes > 0 else nn.Identity()
-
-    def reset(self, num_classes: int, pool_type: Optional[str] = None, other: bool = False):
-        if pool_type is not None:
-            assert pool_type in ('avg', '')
-            self.pool_type = pool_type
-        if other:
-            # reset other non-fc layers
-            self.norm = nn.Identity()
-        self.fc = nn.Linear(self.in_features, num_classes)  if num_classes > 0 else nn.Identity()
-
-    def forward(self, x: torch.Tensor, pre_logits: bool = False) -> torch.Tensor:
-        if self.pool_type == 'avg':
-            x = x.mean(dim=1)
-        x = self.norm(x)
-        x = self.drop(x)
-        if pre_logits:
-            return x
-        x = self.fc(x)
+        x = x + self.drop_path2(self.ls2(self.mlp(self.norm2(x))))
         return x
 
 
@@ -422,9 +426,11 @@ class PatchEmbed(nn.Module):
             stride: Tuple[int, ...],
             padding: Tuple[int, ...],
             reshape: bool = True,
+            device=None,
+            dtype=None,
     ):
+        dd = {'device': device, 'dtype': dtype}
         super().__init__()
-
         # Support any number of spatial dimensions
         self.spatial_dims = len(kernel)
         self.reshape = reshape
@@ -434,6 +440,7 @@ class PatchEmbed(nn.Module):
             kernel_size=kernel,
             stride=stride,
             padding=padding,
+            **dd,
         )
 
     def forward(
@@ -467,6 +474,7 @@ class Hiera(nn.Module):
             mask_unit_size: Tuple[int, ...] = (8, 8),  # must divide q_stride ** (#stages-1)
             # mask_unit_attn: which stages use mask unit attention?
             mask_unit_attn: Tuple[bool, ...] = (True, True, False, False),
+            use_expand_proj: bool = True,
             dim_mul: float = 2.0,
             head_mul: float = 2.0,
             patch_kernel: Tuple[int, ...] = (7, 7),
@@ -474,15 +482,27 @@ class Hiera(nn.Module):
             patch_padding: Tuple[int, ...] = (3, 3),
             mlp_ratio: float = 4.0,
             drop_path_rate: float = 0.0,
-            norm_layer: Union[str, nn.Module] = "LayerNorm",
+            init_values: Optional[float] = None,
+            fix_init: bool = True,
+            weight_init: str = '',
+            norm_layer: Union[str, Type[nn.Module]] = "LayerNorm",
             drop_rate: float = 0.0,
+            patch_drop_rate: float = 0.0,
             head_init_scale: float = 0.001,
             sep_pos_embed: bool = False,
+            abs_win_pos_embed: bool = False,
+            global_pos_size: Tuple[int, int] = (14, 14),
+            device=None,
+            dtype=None,
     ):
         super().__init__()
+        dd = {'device': device, 'dtype': dtype}
         self.num_classes = num_classes
+        self.in_chans = in_chans
         self.grad_checkpointing = False
         norm_layer = get_norm_layer(norm_layer)
+        if isinstance(img_size, int):
+            img_size = to_2tuple(img_size)
 
         self.patch_stride = patch_stride
         self.tokens_spatial_shape = [i // s for i, s in zip(img_size, patch_stride)]
@@ -494,6 +514,7 @@ class Hiera(nn.Module):
         self.mu_size, self.mask_unit_size = flat_mu_size, mask_unit_size
         self.mask_spatial_shape = [i // s for i, s in zip(self.tokens_spatial_shape, self.mask_unit_size)]
         self.stage_ends = [sum(stages[:i]) - 1 for i in range(1, len(stages) + 1)]
+        self.patch_drop_rate = patch_drop_rate
 
         self.patch_embed = PatchEmbed(
             in_chans,
@@ -501,21 +522,27 @@ class Hiera(nn.Module):
             patch_kernel,
             patch_stride,
             patch_padding,
-            #reshape=False,  # leave spatial / temporal dims in output
+            **dd,
         )
 
+        self.pos_embed: Optional[nn.Parameter] = None
+        self.pos_embed_win: Optional[nn.Parameter] = None
+        self.pos_embed_spatial: Optional[nn.Parameter] = None
+        self.pos_embed_temporal: Optional[nn.Parameter] = None
         if sep_pos_embed:
-            self.pos_embed = None
             self.pos_embed_spatial = nn.Parameter(
-                torch.zeros(1, self.tokens_spatial_shape[1] * self.tokens_spatial_shape[2], embed_dim)
+                torch.zeros(1, self.tokens_spatial_shape[1] * self.tokens_spatial_shape[2], embed_dim, **dd)
             )
             self.pos_embed_temporal = nn.Parameter(
-                torch.zeros(1, self.tokens_spatial_shape[0], embed_dim)
+                torch.zeros(1, self.tokens_spatial_shape[0], embed_dim, **dd)
             )
         else:
-            self.pos_embed = nn.Parameter(torch.zeros(1, num_tokens, embed_dim))
-            self.pos_embed_spatial = None
-            self.pos_embed_temporal = None
+            if abs_win_pos_embed:
+                # absolute win, params NCHW to make tile & interpolate more natural before add & reshape
+                self.pos_embed = nn.Parameter(torch.zeros(1, embed_dim, *global_pos_size, **dd))
+                self.pos_embed_win = nn.Parameter(torch.zeros(1, embed_dim, *mask_unit_size, **dd))
+            else:
+                self.pos_embed = nn.Parameter(torch.zeros(1, num_tokens, embed_dim, **dd))
 
         # Setup roll and reroll modules
         self.unroll = Unroll(
@@ -536,7 +563,7 @@ class Hiera(nn.Module):
         # Transformer blocks
         cur_stage = 0
         depth = sum(stages)
-        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)] # stochastic depth decay rule
+        dpr = calculate_drop_path_rates(drop_path_rate, depth)  # stochastic depth decay rule
         self.blocks = nn.ModuleList()
         self.feature_info = []
         for i in range(depth):
@@ -559,10 +586,13 @@ class Hiera(nn.Module):
                 heads=num_heads,
                 mlp_ratio=mlp_ratio,
                 drop_path=dpr[i],
+                init_values=init_values,
                 norm_layer=norm_layer,
                 q_stride=(flat_q_stride if i in q_pool_blocks else 1),
                 window_size=flat_mu_size,
+                use_expand_proj=use_expand_proj,
                 use_mask_unit_attn=use_mask_unit_attn,
+                **dd,
             )
             embed_dim = dim_out
             if i in self.stage_ends:
@@ -570,13 +600,15 @@ class Hiera(nn.Module):
                     dict(num_chs=dim_out, reduction=2**(cur_stage+2), module=f'blocks.{self.stage_ends[cur_stage]}')]
             self.blocks.append(block)
 
-        self.num_features = embed_dim
-        self.head = NormClassifierHead(
+        self.num_features = self.head_hidden_size = embed_dim
+        self.head = ClNormMlpClassifierHead(
             embed_dim,
             num_classes,
             pool_type=global_pool,
             drop_rate=drop_rate,
             norm_layer=norm_layer,
+            input_fmt='NLC',
+            **dd,
         )
 
         # Initialize everything
@@ -584,32 +616,42 @@ class Hiera(nn.Module):
             nn.init.trunc_normal_(self.pos_embed_spatial, std=0.02)
             nn.init.trunc_normal_(self.pos_embed_temporal, std=0.02)
         else:
-            nn.init.trunc_normal_(self.pos_embed, std=0.02)
-        self.apply(partial(self._init_weights))
+            if self.pos_embed is not None:
+                nn.init.trunc_normal_(self.pos_embed, std=0.02)
+            if self.pos_embed_win is not None:
+                nn.init.trunc_normal_(self.pos_embed_win, std=0.02)
+
+        if weight_init != 'skip':
+            init_fn = init_weight_jax if weight_init == 'jax' else init_weight_vit
+            init_fn = partial(init_fn, classifier_name='head.fc')
+            named_apply(init_fn, self)
+        if fix_init:
+            self.fix_init_weight()
         if isinstance(self.head.fc, nn.Linear):
             self.head.fc.weight.data.mul_(head_init_scale)
             self.head.fc.bias.data.mul_(head_init_scale)
 
-    def _init_weights(self, m, init_bias=0.02):
-        if isinstance(m, (nn.Linear, nn.Conv1d, nn.Conv2d, nn.Conv3d)):
-            nn.init.trunc_normal_(m.weight, std=0.02)
-            if isinstance(m, nn.Linear) and m.bias is not None:
-                nn.init.constant_(m.bias, init_bias)
-        elif isinstance(m, nn.LayerNorm):
-            nn.init.constant_(m.bias, init_bias)
-            nn.init.constant_(m.weight, 1.0)
+    def fix_init_weight(self):
+        def rescale(param, _layer_id):
+            param.div_(math.sqrt(2.0 * _layer_id))
+
+        for layer_id, layer in enumerate(self.blocks):
+            rescale(layer.attn.proj.weight.data, layer_id + 1)
+            rescale(layer.mlp.fc2.weight.data, layer_id + 1)
 
     @torch.jit.ignore
     def no_weight_decay(self):
         if self.pos_embed is not None:
             return ["pos_embed"]
+        elif self.pos_embed_abs is not None:
+            return ['pos_embed_abs', 'pos_embed_win']
         else:
             return ["pos_embed_spatial", "pos_embed_temporal"]
 
     @torch.jit.ignore
     def group_matcher(self, coarse: bool = False) -> Dict:
         return dict(
-            stem=r'^pos_embed|pos_embed_spatial|pos_embed_temporal|patch_embed',  # stem and embed
+            stem=r'^pos_embed|pos_embed_spatial|pos_embed_temporal|pos_embed_abs|pos_embed_win|patch_embed',
             blocks=[(r'^blocks\.(\d+)', None), (r'^norm', (99999,))]
         )
 
@@ -621,9 +663,9 @@ class Hiera(nn.Module):
     def get_classifier(self):
         return self.head.fc
 
-    def reset_classifier(self, num_classes: int, global_pool: Optional[str] = None, other: bool = False):
+    def reset_classifier(self, num_classes: int, global_pool: Optional[str] = None, reset_other: bool = False):
         self.num_classes = num_classes
-        self.head.reset(num_classes, global_pool, other=other)
+        self.head.reset(num_classes, global_pool, reset_other=reset_other)
 
     def get_random_mask(self, x: torch.Tensor, mask_ratio: float) -> torch.Tensor:
         """
@@ -650,7 +692,19 @@ class Hiera(nn.Module):
         return mask.bool()
 
     def _pos_embed(self, x) -> torch.Tensor:
-        if self.pos_embed is not None:
+        if self.pos_embed_win is not None:
+            # absolute win position embedding, from
+            # Window Attention is Bugged: How not to Interpolate Position Embeddings (https://arxiv.org/abs/2311.05613)
+            pos_embed_win = self.pos_embed_win.tile(self.mask_spatial_shape)
+            pos_embed = F.interpolate(
+                self.pos_embed,
+                size=pos_embed_win.shape[-2:],
+                mode='bicubic',
+                antialias=True,
+            )
+            pos_embed = pos_embed + pos_embed_win
+            pos_embed = pos_embed.flatten(2).transpose(1, 2)
+        elif self.pos_embed is not None:
             pos_embed = self.pos_embed
         else:
             pos_embed = (
@@ -669,11 +723,12 @@ class Hiera(nn.Module):
             self,
             x: torch.Tensor,
             mask: Optional[torch.Tensor] = None,
-            indices: Optional[Union[int, List[int], Tuple[int]]] = None,
+            indices: Optional[Union[int, List[int]]] = None,
             norm: bool = False,
             stop_early: bool = True,
             output_fmt: str = 'NCHW',
             intermediates_only: bool = False,
+            coarse: bool = True,
     ) -> Union[List[torch.Tensor], Tuple[torch.Tensor, List[torch.Tensor]]]:
         """ Forward features that returns intermediates.
 
@@ -688,10 +743,13 @@ class Hiera(nn.Module):
 
         """
         assert not norm, 'normalization of features not supported'
-        assert output_fmt in ('NCHW',), 'Output format must be one of NCHW.'
-        take_indices, max_index = feature_take_indices(len(self.stage_ends), indices)
-        take_indices = [self.stage_ends[i] for i in take_indices]
-        max_index = self.stage_ends[max_index]
+        assert output_fmt in ('NCHW', 'NHWC'), 'Output format must be one of NCHW, NHWC.'
+        if coarse:
+            take_indices, max_index = feature_take_indices(len(self.stage_ends), indices)
+            take_indices = [self.stage_ends[i] for i in take_indices]
+            max_index = self.stage_ends[max_index]
+        else:
+            take_indices, max_index = feature_take_indices(len(self.blocks), indices)
 
         if mask is not None:
             patch_mask = mask.view(x.shape[0], 1, *self.mask_spatial_shape)  # B, C, *mask_spatial_shape
@@ -711,9 +769,13 @@ class Hiera(nn.Module):
         else:
             blocks = self.blocks[:max_index + 1]
         for i, blk in enumerate(blocks):
-            x = blk(x)
+            if self.grad_checkpointing and not torch.jit.is_scripting():
+                x = checkpoint(blk, x)
+            else:
+                x = blk(x)
             if i in take_indices:
-                intermediates.append(self.reroll(x, i, mask=mask).permute(0, 3, 1, 2))
+                x_int = self.reroll(x, i, mask=mask)
+                intermediates.append(x_int.permute(0, 3, 1, 2) if output_fmt == 'NCHW' else x_int)
 
         if intermediates_only:
             return intermediates
@@ -722,19 +784,22 @@ class Hiera(nn.Module):
 
     def prune_intermediate_layers(
             self,
-            indices: Union[int, List[int], Tuple[int]] = 1,
+            indices: Union[int, List[int]] = 1,
             prune_norm: bool = False,
             prune_head: bool = True,
+            coarse: bool = True,
     ):
         """ Prune layers not required for specified intermediates.
         """
-        take_indices, max_index = feature_take_indices(len(self.stage_ends), indices)
-        max_index = self.stage_ends[max_index]
+        if coarse:
+            take_indices, max_index = feature_take_indices(len(self.stage_ends), indices)
+            max_index = self.stage_ends[max_index]
+        else:
+            take_indices, max_index = feature_take_indices(len(self.blocks), indices)
         self.blocks = self.blocks[:max_index + 1]  # truncate blocks
         if prune_head:
-            self.head.reset(0, other=True)
+            self.head.reset(0, reset_other=True)
         return take_indices
-
 
     def forward_features(
             self,
@@ -746,6 +811,11 @@ class Hiera(nn.Module):
         mask should be a boolean tensor of shape [B, #MUt*#MUy*#MUx] where #MU are the number of mask units in that dim.
         Note: 1 in mask is *keep*, 0 is *remove*; mask.sum(dim=-1) should be the same across the batch.
         """
+        if self.training and self.patch_drop_rate > 0:
+            # using mask for something like 'patch dropout' via mask-units in supervised train / fine-tune
+            assert mask is None
+            mask = self.get_random_mask(x, mask_ratio=self.patch_drop_rate)
+
         if mask is not None:
             patch_mask = mask.view(x.shape[0], 1, *self.mask_spatial_shape)  # B, C, *mask_spatial_shape
         else:
@@ -798,8 +868,10 @@ def _cfg(url='', **kwargs):
         'crop_pct': .9, 'interpolation': 'bicubic', 'fixed_input_size': True,
         'mean': IMAGENET_DEFAULT_MEAN, 'std': IMAGENET_DEFAULT_STD,
         'first_conv': 'patch_embed.proj', 'classifier': 'head.fc',
+        'license': 'apache-2.0',
         **kwargs
     }
+
 
 default_cfgs = generate_default_cfgs({
     "hiera_tiny_224.mae_in1k_ft_in1k": _cfg(
@@ -861,29 +933,53 @@ default_cfgs = generate_default_cfgs({
         license='cc-by-nc-4.0',
         num_classes=0,
     ),
+
+    "hiera_small_abswin_256.sbb2_e200_in12k_ft_in1k": _cfg(
+        hf_hub_id='timm/',
+        input_size=(3, 256, 256), crop_pct=0.95,
+    ),
+    "hiera_small_abswin_256.sbb2_pd_e200_in12k_ft_in1k": _cfg(
+        hf_hub_id='timm/',
+        input_size=(3, 256, 256), crop_pct=0.95,
+    ),
+    "hiera_small_abswin_256.sbb2_e200_in12k": _cfg(
+        hf_hub_id='timm/',
+        num_classes=11821,
+        input_size=(3, 256, 256), crop_pct=0.95,
+    ),
+    "hiera_small_abswin_256.sbb2_pd_e200_in12k": _cfg(
+        hf_hub_id='timm/',
+        num_classes=11821,
+        input_size=(3, 256, 256), crop_pct=0.95,
+    ),
+    "hiera_base_abswin_256.untrained": _cfg(
+        # hf_hub_id='timm/',
+        input_size=(3, 256, 256), crop_pct=0.95,
+    ),
 })
+
 
 def checkpoint_filter_fn(state_dict, model=None):
     state_dict = state_dict.get('model_state', state_dict)
     output = {}
     for k, v in state_dict.items():
-        if k == 'pos_embed' and v.shape[1] != model.pos_embed.shape[1]:
-            # # To resize pos embedding when using model at different size from pretrained weights
-            # from timm.layers import resample_abs_pos_embed
-            # v = resample_abs_pos_embed(
-            #     v,
-            #     new_size=(64, 64),
-            #     num_prefix_tokens=0,
-            #     verbose=True,
-            # )
-            #v = F.interpolate(v.transpose(1, 2), (model.pos_embed.shape[1],)).transpose(1, 2)
-            pass
+        # if k == 'pos_embed' and  v.shape[1] != model.pos_embed.shape[1]:
+        #     # To resize pos embedding when using model at different size from pretrained weights
+        #     from timm.layers import resample_abs_pos_embed
+        #     v = resample_abs_pos_embed(
+        #         v,
+        #         new_size=(64, 64),
+        #         num_prefix_tokens=0,
+        #         verbose=True,
+        #     )
         if 'head.projection.' in k:
             k = k.replace('head.projection.', 'head.fc.')
         if k.startswith('encoder_norm.'):
             k = k.replace('encoder_norm.', 'head.norm.')
         elif k.startswith('norm.'):
             k = k.replace('norm.', 'head.norm.')
+        if k == 'pos_embed_abs':
+            k = 'pos_embed'
         output[k] = v
     return output
 
@@ -900,37 +996,54 @@ def _create_hiera(variant: str, pretrained: bool = False, **kwargs) -> Hiera:
         **kwargs,
     )
 
+
 @register_model
-def hiera_tiny_224(pretrained = False, **kwargs):
+def hiera_tiny_224(pretrained=False, **kwargs):
     model_args = dict(embed_dim=96, num_heads=1, stages=(1, 2, 7, 2))
     return _create_hiera('hiera_tiny_224', pretrained=pretrained, **dict(model_args, **kwargs))
 
 
 @register_model
-def hiera_small_224(pretrained = False, **kwargs):
+def hiera_small_224(pretrained=False, **kwargs):
     model_args = dict(embed_dim=96, num_heads=1, stages=(1, 2, 11, 2))
     return _create_hiera('hiera_small_224', pretrained=pretrained, **dict(model_args, **kwargs))
 
 
 @register_model
-def hiera_base_224(pretrained = False, **kwargs):
+def hiera_base_224(pretrained=False, **kwargs):
     model_args = dict(embed_dim=96, num_heads=1, stages=(2, 3, 16, 3))
     return _create_hiera('hiera_base_224', pretrained=pretrained, **dict(model_args, **kwargs))
 
 
 @register_model
-def hiera_base_plus_224(pretrained = False, **kwargs):
+def hiera_base_plus_224(pretrained=False, **kwargs):
     model_args = dict(embed_dim=112, num_heads=2, stages=(2, 3, 16, 3))
     return _create_hiera('hiera_base_plus_224', pretrained=pretrained, **dict(model_args, **kwargs))
 
 
 @register_model
-def hiera_large_224(pretrained = False, **kwargs):
+def hiera_large_224(pretrained=False, **kwargs):
     model_args = dict(embed_dim=144, num_heads=2, stages=(2, 6, 36, 4))
     return _create_hiera('hiera_large_224', pretrained=pretrained, **dict(model_args, **kwargs))
 
 
 @register_model
-def hiera_huge_224(pretrained = False, **kwargs):
+def hiera_huge_224(pretrained=False, **kwargs):
     model_args = dict(embed_dim=256, num_heads=4, stages=(2, 6, 36, 4))
     return _create_hiera('hiera_huge_224', pretrained=pretrained, **dict(model_args, **kwargs))
+
+
+@register_model
+def hiera_small_abswin_256(pretrained=False, **kwargs):
+    model_args = dict(
+        embed_dim=96, num_heads=1, stages=(1, 2, 11, 2), abs_win_pos_embed=True, global_pos_size=(16, 16),
+        init_values=1e-5, weight_init='jax', use_expand_proj=False,
+    )
+    return _create_hiera('hiera_small_abswin_256', pretrained=pretrained, **dict(model_args, **kwargs))
+
+
+@register_model
+def hiera_base_abswin_256(pretrained=False, **kwargs):
+    model_args = dict(
+        embed_dim=96, num_heads=1, stages=(2, 3, 16, 3), abs_win_pos_embed=True, init_values=1e-5, weight_init='jax')
+    return _create_hiera('hiera_base_abswin_256', pretrained=pretrained, **dict(model_args, **kwargs))

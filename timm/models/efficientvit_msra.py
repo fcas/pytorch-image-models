@@ -9,7 +9,8 @@ Adapted from official impl at https://github.com/microsoft/Cream/tree/main/Effic
 __all__ = ['EfficientVitMsra']
 import itertools
 from collections import OrderedDict
-from typing import Dict, Optional
+from functools import partial
+from typing import Dict, List, Optional, Tuple, Type, Union
 
 import torch
 import torch.nn as nn
@@ -17,17 +18,30 @@ import torch.nn as nn
 from timm.data import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
 from timm.layers import SqueezeExcite, SelectAdaptivePool2d, trunc_normal_, _assert
 from ._builder import build_model_with_cfg
-from ._manipulate import checkpoint_seq
+from ._features import feature_take_indices
+from ._manipulate import checkpoint, checkpoint_seq
 from ._registry import register_model, generate_default_cfgs
 
 
 class ConvNorm(torch.nn.Sequential):
-    def __init__(self, in_chs, out_chs, ks=1, stride=1, pad=0, dilation=1, groups=1, bn_weight_init=1):
+    def __init__(
+            self,
+            in_chs: int,
+            out_chs: int,
+            ks: int = 1,
+            stride: int = 1,
+            pad: int = 0,
+            dilation: int = 1,
+            groups: int = 1,
+            bn_weight_init: float = 1,
+            device=None,
+            dtype=None,
+    ):
+        dd = {'device': device, 'dtype': dtype}
         super().__init__()
-        self.conv = nn.Conv2d(in_chs, out_chs, ks, stride, pad, dilation, groups, bias=False)
-        self.bn = nn.BatchNorm2d(out_chs)
+        self.conv = nn.Conv2d(in_chs, out_chs, ks, stride, pad, dilation, groups, bias=False, **dd)
+        self.bn = nn.BatchNorm2d(out_chs, **dd)
         torch.nn.init.constant_(self.bn.weight, bn_weight_init)
-        torch.nn.init.constant_(self.bn.bias, 0)
 
     @torch.no_grad()
     def fuse(self):
@@ -45,11 +59,21 @@ class ConvNorm(torch.nn.Sequential):
 
 
 class NormLinear(torch.nn.Sequential):
-    def __init__(self, in_features, out_features, bias=True, std=0.02, drop=0.):
+    def __init__(
+            self,
+            in_features: int,
+            out_features: int,
+            bias: bool = True,
+            std: float = 0.02,
+            drop: float = 0.,
+            device=None,
+            dtype=None,
+    ):
+        dd = {'device': device, 'dtype': dtype}
         super().__init__()
-        self.bn = nn.BatchNorm1d(in_features)
+        self.bn = nn.BatchNorm1d(in_features, **dd)
         self.drop = nn.Dropout(drop)
-        self.linear = nn.Linear(in_features, out_features, bias=bias)
+        self.linear = nn.Linear(in_features, out_features, bias=bias, **dd)
 
         trunc_normal_(self.linear.weight, std=std)
         if self.linear.bias is not None:
@@ -73,14 +97,21 @@ class NormLinear(torch.nn.Sequential):
 
 
 class PatchMerging(torch.nn.Module):
-    def __init__(self, dim, out_dim):
+    def __init__(
+            self,
+            dim: int,
+            out_dim: int,
+            device=None,
+            dtype=None,
+    ):
+        dd = {'device': device, 'dtype': dtype}
         super().__init__()
         hid_dim = int(dim * 4)
-        self.conv1 = ConvNorm(dim, hid_dim, 1, 1, 0)
+        self.conv1 = ConvNorm(dim, hid_dim, 1, 1, 0, **dd)
         self.act = torch.nn.ReLU()
-        self.conv2 = ConvNorm(hid_dim, hid_dim, 3, 2, 1, groups=hid_dim)
-        self.se = SqueezeExcite(hid_dim, .25)
-        self.conv3 = ConvNorm(hid_dim, out_dim, 1, 1, 0)
+        self.conv2 = ConvNorm(hid_dim, hid_dim, 3, 2, 1, groups=hid_dim, **dd)
+        self.se = SqueezeExcite(hid_dim, .25, **dd)
+        self.conv3 = ConvNorm(hid_dim, out_dim, 1, 1, 0, **dd)
 
     def forward(self, x):
         x = self.conv3(self.se(self.act(self.conv2(self.act(self.conv1(x))))))
@@ -88,7 +119,7 @@ class PatchMerging(torch.nn.Module):
 
 
 class ResidualDrop(torch.nn.Module):
-    def __init__(self, m, drop=0.):
+    def __init__(self, m: nn.Module, drop: float = 0.):
         super().__init__()
         self.m = m
         self.drop = drop
@@ -102,11 +133,18 @@ class ResidualDrop(torch.nn.Module):
 
 
 class ConvMlp(torch.nn.Module):
-    def __init__(self, ed, h):
+    def __init__(
+        self,
+        ed: int,
+        h: int,
+        device=None,
+        dtype=None,
+    ):
+        dd = {'device': device, 'dtype': dtype}
         super().__init__()
-        self.pw1 = ConvNorm(ed, h)
+        self.pw1 = ConvNorm(ed, h, **dd)
         self.act = torch.nn.ReLU()
-        self.pw2 = ConvNorm(h, ed, bn_weight_init=0)
+        self.pw2 = ConvNorm(h, ed, bn_weight_init=0, **dd)
 
     def forward(self, x):
         x = self.pw2(self.act(self.pw1(x)))
@@ -128,13 +166,16 @@ class CascadedGroupAttention(torch.nn.Module):
     """
     def __init__(
             self,
-            dim,
-            key_dim,
-            num_heads=8,
-            attn_ratio=4,
-            resolution=14,
-            kernels=(5, 5, 5, 5),
+            dim: int,
+            key_dim: int,
+            num_heads: int = 8,
+            attn_ratio: int = 4,
+            resolution: int = 14,
+            kernels: Tuple[int, ...] = (5, 5, 5, 5),
+            device=None,
+            dtype=None,
     ):
+        dd = {'device': device, 'dtype': dtype}
         super().__init__()
         self.num_heads = num_heads
         self.scale = key_dim ** -0.5
@@ -145,17 +186,38 @@ class CascadedGroupAttention(torch.nn.Module):
         qkvs = []
         dws = []
         for i in range(num_heads):
-            qkvs.append(ConvNorm(dim // (num_heads), self.key_dim * 2 + self.val_dim))
-            dws.append(ConvNorm(self.key_dim, self.key_dim, kernels[i], 1, kernels[i] // 2, groups=self.key_dim))
+            qkvs.append(ConvNorm(dim // num_heads, self.key_dim * 2 + self.val_dim, **dd))
+            dws.append(ConvNorm(self.key_dim, self.key_dim, kernels[i], 1, kernels[i] // 2, groups=self.key_dim, **dd))
         self.qkvs = torch.nn.ModuleList(qkvs)
         self.dws = torch.nn.ModuleList(dws)
         self.proj = torch.nn.Sequential(
             torch.nn.ReLU(),
-            ConvNorm(self.val_dim * num_heads, dim, bn_weight_init=0)
+            ConvNorm(self.val_dim * num_heads, dim, bn_weight_init=0, **dd)
         )
 
-        points = list(itertools.product(range(resolution), range(resolution)))
-        N = len(points)
+        self.resolution = resolution
+        N = resolution * resolution
+        # Number of unique offsets: abs differences range from 0 to resolution-1 for each dim
+        num_offsets = resolution * resolution
+        self.attention_biases = torch.nn.Parameter(torch.empty(num_heads, num_offsets, **dd))
+        self.register_buffer(
+            'attention_bias_idxs',
+            torch.empty((N, N), device=device, dtype=torch.long),
+            persistent=False,
+        )
+        self.attention_bias_cache = {}
+
+        # TODO: skip init when on meta device when safe to do so
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        """Initialize parameters and buffers."""
+        torch.nn.init.zeros_(self.attention_biases)
+        self._init_buffers()
+
+    def _init_buffers(self) -> None:
+        """Compute and fill non-persistent buffer values."""
+        points = list(itertools.product(range(self.resolution), range(self.resolution)))
         attention_offsets = {}
         idxs = []
         for p1 in points:
@@ -164,9 +226,11 @@ class CascadedGroupAttention(torch.nn.Module):
                 if offset not in attention_offsets:
                     attention_offsets[offset] = len(attention_offsets)
                 idxs.append(attention_offsets[offset])
-        self.attention_biases = torch.nn.Parameter(torch.zeros(num_heads, len(attention_offsets)))
-        self.register_buffer('attention_bias_idxs', torch.LongTensor(idxs).view(N, N), persistent=False)
-        self.attention_bias_cache = {}
+        self.attention_bias_idxs.copy_(torch.tensor(idxs, dtype=torch.long).view(len(points), len(points)))
+
+    def init_non_persistent_buffers(self) -> None:
+        """Initialize non-persistent buffers."""
+        self._init_buffers()
 
     @torch.no_grad()
     def train(self, mode=True):
@@ -221,14 +285,17 @@ class LocalWindowAttention(torch.nn.Module):
     """
     def __init__(
             self,
-            dim,
-            key_dim,
-            num_heads=8,
-            attn_ratio=4,
-            resolution=14,
-            window_resolution=7,
-            kernels=(5, 5, 5, 5),
+            dim: int,
+            key_dim: int,
+            num_heads: int = 8,
+            attn_ratio: int = 4,
+            resolution: int = 14,
+            window_resolution: int = 7,
+            kernels: Tuple[int, ...] = (5, 5, 5, 5),
+            device=None,
+            dtype=None,
     ):
+        dd = {'device': device, 'dtype': dtype}
         super().__init__()
         self.dim = dim
         self.num_heads = num_heads
@@ -241,12 +308,13 @@ class LocalWindowAttention(torch.nn.Module):
             attn_ratio=attn_ratio,
             resolution=window_resolution,
             kernels=kernels,
+            **dd,
         )
 
     def forward(self, x):
         H = W = self.resolution
         B, C, H_, W_ = x.shape
-        # Only check this for classifcation models
+        # Only check this for classification models
         _assert(H == H_, f'input feature has wrong size, expect {(H, W)}, got {(H_, W_)}')
         _assert(W == W_, f'input feature has wrong size, expect {(H, W)}, got {(H_, W_)}')
         if H <= self.window_resolution and W <= self.window_resolution:
@@ -286,18 +354,21 @@ class EfficientVitBlock(torch.nn.Module):
     """
     def __init__(
             self,
-            dim,
-            key_dim,
-            num_heads=8,
-            attn_ratio=4,
-            resolution=14,
-            window_resolution=7,
-            kernels=[5, 5, 5, 5],
+            dim: int,
+            key_dim: int,
+            num_heads: int = 8,
+            attn_ratio: int = 4,
+            resolution: int = 14,
+            window_resolution: int = 7,
+            kernels: List[int] = [5, 5, 5, 5],
+            device=None,
+            dtype=None,
     ):
+        dd = {'device': device, 'dtype': dtype}
         super().__init__()
 
-        self.dw0 = ResidualDrop(ConvNorm(dim, dim, 3, 1, 1, groups=dim, bn_weight_init=0.))
-        self.ffn0 = ResidualDrop(ConvMlp(dim, int(dim * 2)))
+        self.dw0 = ResidualDrop(ConvNorm(dim, dim, 3, 1, 1, groups=dim, bn_weight_init=0., **dd))
+        self.ffn0 = ResidualDrop(ConvMlp(dim, int(dim * 2), **dd))
 
         self.mixer = ResidualDrop(
             LocalWindowAttention(
@@ -306,11 +377,12 @@ class EfficientVitBlock(torch.nn.Module):
                 resolution=resolution,
                 window_resolution=window_resolution,
                 kernels=kernels,
-            )
+                **dd,
+            ),
         )
 
-        self.dw1 = ResidualDrop(ConvNorm(dim, dim, 3, 1, 1, groups=dim, bn_weight_init=0.))
-        self.ffn1 = ResidualDrop(ConvMlp(dim, int(dim * 2)))
+        self.dw1 = ResidualDrop(ConvNorm(dim, dim, 3, 1, 1, groups=dim, bn_weight_init=0., **dd))
+        self.ffn1 = ResidualDrop(ConvMlp(dim, int(dim * 2), **dd))
 
     def forward(self, x):
         return self.ffn1(self.dw1(self.mixer(self.ffn0(self.dw0(x)))))
@@ -319,17 +391,20 @@ class EfficientVitBlock(torch.nn.Module):
 class EfficientVitStage(torch.nn.Module):
     def __init__(
             self,
-            in_dim,
-            out_dim,
-            key_dim,
-            downsample=('', 1),
-            num_heads=8,
-            attn_ratio=4,
-            resolution=14,
-            window_resolution=7,
-            kernels=[5, 5, 5, 5],
-            depth=1,
+            in_dim: int,
+            out_dim: int,
+            key_dim: int,
+            downsample: Tuple[str, int] = ('', 1),
+            num_heads: int = 8,
+            attn_ratio: int = 4,
+            resolution: int = 14,
+            window_resolution: int = 7,
+            kernels: List[int] = [5, 5, 5, 5],
+            depth: int = 1,
+            device=None,
+            dtype=None,
     ):
+        dd = {'device': device, 'dtype': dtype}
         super().__init__()
         if downsample[0] == 'subsample':
             self.resolution = (resolution - 1) // downsample[1] + 1
@@ -337,16 +412,16 @@ class EfficientVitStage(torch.nn.Module):
             down_blocks.append((
                 'res1',
                 torch.nn.Sequential(
-                    ResidualDrop(ConvNorm(in_dim, in_dim, 3, 1, 1, groups=in_dim)),
-                    ResidualDrop(ConvMlp(in_dim, int(in_dim * 2))),
+                    ResidualDrop(ConvNorm(in_dim, in_dim, 3, 1, 1, groups=in_dim, **dd)),
+                    ResidualDrop(ConvMlp(in_dim, int(in_dim * 2), **dd)),
                 )
             ))
-            down_blocks.append(('patchmerge', PatchMerging(in_dim, out_dim)))
+            down_blocks.append(('patchmerge', PatchMerging(in_dim, out_dim, **dd)))
             down_blocks.append((
                 'res2',
                 torch.nn.Sequential(
-                    ResidualDrop(ConvNorm(out_dim, out_dim, 3, 1, 1, groups=out_dim)),
-                    ResidualDrop(ConvMlp(out_dim, int(out_dim * 2))),
+                    ResidualDrop(ConvNorm(out_dim, out_dim, 3, 1, 1, groups=out_dim, **dd)),
+                    ResidualDrop(ConvMlp(out_dim, int(out_dim * 2), **dd)),
                 )
             ))
             self.downsample = nn.Sequential(OrderedDict(down_blocks))
@@ -357,7 +432,16 @@ class EfficientVitStage(torch.nn.Module):
 
         blocks = []
         for d in range(depth):
-            blocks.append(EfficientVitBlock(out_dim, key_dim, num_heads, attn_ratio, self.resolution, window_resolution, kernels))
+            blocks.append(EfficientVitBlock(
+                out_dim,
+                key_dim,
+                num_heads,
+                attn_ratio,
+                self.resolution,
+                window_resolution,
+                kernels,
+                **dd,
+            ))
         self.blocks = nn.Sequential(*blocks)
 
     def forward(self, x):
@@ -367,41 +451,52 @@ class EfficientVitStage(torch.nn.Module):
 
 
 class PatchEmbedding(torch.nn.Sequential):
-    def __init__(self, in_chans, dim):
+    def __init__(
+            self,
+            in_chans: int,
+            dim: int,
+            device=None,
+            dtype=None,
+    ):
         super().__init__()
-        self.add_module('conv1', ConvNorm(in_chans, dim // 8, 3, 2, 1))
+        dd = {'device': device, 'dtype': dtype}
+        self.add_module('conv1', ConvNorm(in_chans, dim // 8, 3, 2, 1, **dd))
         self.add_module('relu1', torch.nn.ReLU())
-        self.add_module('conv2', ConvNorm(dim // 8, dim // 4, 3, 2, 1))
+        self.add_module('conv2', ConvNorm(dim // 8, dim // 4, 3, 2, 1, **dd))
         self.add_module('relu2', torch.nn.ReLU())
-        self.add_module('conv3', ConvNorm(dim // 4, dim // 2, 3, 2, 1))
+        self.add_module('conv3', ConvNorm(dim // 4, dim // 2, 3, 2, 1, **dd))
         self.add_module('relu3', torch.nn.ReLU())
-        self.add_module('conv4', ConvNorm(dim // 2, dim, 3, 2, 1))
+        self.add_module('conv4', ConvNorm(dim // 2, dim, 3, 2, 1, **dd))
         self.patch_size = 16
 
 
 class EfficientVitMsra(nn.Module):
     def __init__(
             self,
-            img_size=224,
-            in_chans=3,
-            num_classes=1000,
-            embed_dim=(64, 128, 192),
-            key_dim=(16, 16, 16),
-            depth=(1, 2, 3),
-            num_heads=(4, 4, 4),
-            window_size=(7, 7, 7),
-            kernels=(5, 5, 5, 5),
-            down_ops=(('', 1), ('subsample', 2), ('subsample', 2)),
-            global_pool='avg',
-            drop_rate=0.,
+            img_size: int = 224,
+            in_chans: int = 3,
+            num_classes: int = 1000,
+            embed_dim: Tuple[int, ...] = (64, 128, 192),
+            key_dim: Tuple[int, ...] = (16, 16, 16),
+            depth: Tuple[int, ...] = (1, 2, 3),
+            num_heads: Tuple[int, ...] = (4, 4, 4),
+            window_size: Tuple[int, ...] = (7, 7, 7),
+            kernels: Tuple[int, ...] = (5, 5, 5, 5),
+            down_ops: Tuple[Tuple[str, int], ...] = (('', 1), ('subsample', 2), ('subsample', 2)),
+            global_pool: str = 'avg',
+            drop_rate: float = 0.,
+            device=None,
+            dtype=None,
     ):
-        super(EfficientVitMsra, self).__init__()
+        super().__init__()
+        dd = {'device': device, 'dtype': dtype}
         self.grad_checkpointing = False
         self.num_classes = num_classes
+        self.in_chans = in_chans
         self.drop_rate = drop_rate
 
         # Patch embedding
-        self.patch_embed = PatchEmbedding(in_chans, embed_dim[0])
+        self.patch_embed = PatchEmbedding(in_chans, embed_dim[0], **dd)
         stride = self.patch_embed.patch_size
         resolution = img_size // self.patch_embed.patch_size
         attn_ratio = [embed_dim[i] / (key_dim[i] * num_heads[i]) for i in range(len(embed_dim))]
@@ -423,6 +518,7 @@ class EfficientVitMsra(nn.Module):
                 window_resolution=wd,
                 kernels=kernels,
                 depth=dpth,
+                **dd,
             )
             pre_ed = ed
             if do[0] == 'subsample' and i != 0:
@@ -437,9 +533,19 @@ class EfficientVitMsra(nn.Module):
         else:
             assert num_classes == 0
             self.global_pool = nn.Identity()
-        self.num_features = embed_dim[-1]
+        self.num_features = self.head_hidden_size = embed_dim[-1]
         self.head = NormLinear(
-            self.num_features, num_classes, drop=self.drop_rate) if num_classes > 0 else torch.nn.Identity()
+            self.num_features, num_classes, drop=self.drop_rate, **dd) if num_classes > 0 else torch.nn.Identity()
+
+        # TODO: skip init when on meta device when safe to do so
+        self.init_weights(needs_reset=False)
+
+    def init_weights(self, needs_reset: bool = True):
+        self.apply(partial(self._init_weights, needs_reset=needs_reset))
+
+    def _init_weights(self, m: nn.Module, needs_reset: bool = True) -> None:
+        if needs_reset and hasattr(m, 'reset_parameters'):
+            m.reset_parameters()
 
     @torch.jit.ignore
     def no_weight_decay(self):
@@ -461,7 +567,7 @@ class EfficientVitMsra(nn.Module):
         self.grad_checkpointing = enable
 
     @torch.jit.ignore
-    def get_classifier(self):
+    def get_classifier(self) -> nn.Module:
         return self.head.linear
 
     def reset_classifier(self, num_classes: int, global_pool: Optional[str] = None):
@@ -474,6 +580,66 @@ class EfficientVitMsra(nn.Module):
                 self.global_pool = nn.Identity()
         self.head = NormLinear(
             self.num_features, num_classes, drop=self.drop_rate) if num_classes > 0 else torch.nn.Identity()
+
+    def forward_intermediates(
+            self,
+            x: torch.Tensor,
+            indices: Optional[Union[int, List[int]]] = None,
+            norm: bool = False,
+            stop_early: bool = False,
+            output_fmt: str = 'NCHW',
+            intermediates_only: bool = False,
+    ) -> Union[List[torch.Tensor], Tuple[torch.Tensor, List[torch.Tensor]]]:
+        """ Forward features that returns intermediates.
+
+        Args:
+            x: Input image tensor
+            indices: Take last n blocks if int, all if None, select matching indices if sequence
+            norm: Apply norm layer to compatible intermediates
+            stop_early: Stop iterating over blocks when last desired intermediate hit
+            output_fmt: Shape of intermediate feature outputs
+            intermediates_only: Only return intermediate features
+        Returns:
+
+        """
+        assert output_fmt in ('NCHW',), 'Output shape must be NCHW.'
+        intermediates = []
+        take_indices, max_index = feature_take_indices(len(self.stages), indices)
+
+        # forward pass
+        x = self.patch_embed(x)
+
+        if torch.jit.is_scripting() or not stop_early:  # can't slice blocks in torchscript
+            stages = self.stages
+        else:
+            stages = self.stages[:max_index + 1]
+
+        for feat_idx, stage in enumerate(stages):
+            if self.grad_checkpointing and not torch.jit.is_scripting():
+                x = checkpoint(stage, x)
+            else:
+                x = stage(x)
+            if feat_idx in take_indices:
+                intermediates.append(x)
+
+        if intermediates_only:
+            return intermediates
+
+        return x, intermediates
+
+    def prune_intermediate_layers(
+            self,
+            indices: Union[int, List[int]] = 1,
+            prune_norm: bool = False,
+            prune_head: bool = True,
+    ):
+        """ Prune layers not required for specified intermediates.
+        """
+        take_indices, max_index = feature_take_indices(len(self.stages), indices)
+        self.stages = self.stages[:max_index + 1]  # truncate blocks w/ stem as idx 0
+        if prune_head:
+            self.reset_classifier(0, '')
+        return take_indices
 
     def forward_features(self, x):
         x = self.patch_embed(x)
@@ -537,6 +703,7 @@ def _cfg(url='', **kwargs):
         'classifier': 'head.linear',
         'fixed_input_size': True,
         'pool_size': (4, 4),
+        'license': 'mit',
         **kwargs,
     }
 
